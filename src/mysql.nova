@@ -1,0 +1,906 @@
+// mysql.nova — the MySQL/MariaDB driver, implementing the `db` seam (db.Connection /
+// db.Driver) over the MySQL client/server protocol. Extracted from the PostgreSQL
+// reference driver, adapted to MySQL's very different wire:
+//   - packets are [payload_len:u24 LE][sequence_id:u8][payload] (not [type][len BE]);
+//   - integers/strings are LENGTH-ENCODED (lenenc), not fixed-width;
+//   - a Handshake/HandshakeResponse exchange with salt-based auth (mysql_native_password
+//     = SHA1 scramble; caching_sha2_password fast path = SHA256 scramble — both computed in
+//     the runtime, golden-verified against python hashlib);
+//   - result sets are: column_count, N column-definition packets, EOF, row packets, EOF.
+//
+//   let drv = MyDriver();
+//   let conn = drv.connect("mysql://user:pass@127.0.0.1:3306/mydb");
+//   let rs = conn.query("SELECT id, name FROM users", List<DbValue>());
+//
+// The wire CODEC (framing, lenenc, packet decode) is pure over byte buffers and gated
+// offline; the auth scramble is golden-verified. NOTE: not yet live-verified end-to-end (no
+// MySQL server was available) — the connect/query flow follows the spec but is unproven live.
+import net.asyncio;
+import bytes;
+import string;
+import list;
+import db;
+
+// MySQL auth-response scrambles. These are protocol-specific obfuscations (NOT
+// general cryptography), so they live with the driver rather than in crypto/ —
+// they wrap the raw runtime primitives directly.
+//
+//   native: SHA1(pw) XOR SHA1(salt ++ SHA1(SHA1(pw)))  (20 raw bytes)
+//   sha2:   SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) ++ salt)  (32 raw bytes)
+//
+// `salt` is the server's scramble; the result is binary (may contain NULs).
+// Public so the driver's codec gate can golden-verify them; not general crypto.
+pub fn mysqlNativeScramble(password: string, salt: string): string {
+    return nova_mysql_scramble(password, salt, salt.length);
+}
+
+pub fn mysqlSha2Scramble(password: string, salt: string): string {
+    return nova_mysql_sha2_scramble(password, salt, salt.length);
+}
+
+// D6: caching_sha2_password FULL auth (uncached password over a plaintext channel). The client
+// obfuscates the password by XOR-ing (password + a trailing NUL) with the 20-byte server nonce
+// cyclically, then RSA-OAEP-encrypts that under the server's RSA public key (PEM). Returns the
+// ciphertext (RSA-modulus-sized raw bytes).
+fn rsaEncryptPassword(password: string, salt: string, pem: string): string {
+    let n = password.length + 1;              // include the trailing NUL byte
+    let buf = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        let pc = if (i < password.length) bytes.read_byte(password, i) else 0;
+        let sc = bytes.read_byte(salt, i % salt.length);
+        bytes.write_byte(buf, i, pc ^ sc);
+        i = i + 1;
+    }
+    let xored = buf as string;                 // length-n Nova string (may contain NULs)
+    return nova_rsa_oaep_encrypt(pem, xored, n);
+}
+
+// --- Capability flags (client) ------------------------------------------------
+// LONG_PASSWORD(1) | CONNECT_WITH_DB(8) | PROTOCOL_41(0x200) | TRANSACTIONS(0x2000)
+// | SECURE_CONNECTION(0x8000) | PLUGIN_AUTH(0x80000)
+fn clientCapabilities(): int { return 1 + 8 + 512 + 8192 + 32768 + 524288; }
+
+// --- MySQL column type codes -> seam DbType -----------------------------------
+fn typeToDbType(t: int): DbType {
+    if (t == 1) { return DbType.Int4; }    // TINY
+    if (t == 2) { return DbType.Int4; }    // SHORT
+    if (t == 3) { return DbType.Int4; }    // LONG
+    if (t == 9) { return DbType.Int4; }    // INT24
+    if (t == 8) { return DbType.Int8; }    // LONGLONG
+    if (t == 4) { return DbType.Float4; }  // FLOAT
+    if (t == 5) { return DbType.Float8; }  // DOUBLE
+    if (t == 0) { return DbType.Decimal; }   // DECIMAL
+    if (t == 246) { return DbType.Decimal; } // NEWDECIMAL
+    if (t == 7) { return DbType.Timestamp; }  // TIMESTAMP
+    if (t == 12) { return DbType.Timestamp; } // DATETIME
+    if (t == 252) { return DbType.Blob; }  // BLOB
+    // VARCHAR(15) / VAR_STRING(253) / STRING(254) / anything else -> Text
+    return DbType.Text;
+}
+
+// --- Little-endian + lenenc writers -------------------------------------------
+fn u8b(v: int): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, v % 256); return p as string; }
+fn u16le(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, v % 256);
+    bytes.write_byte(p, 1, (v / 256) % 256);
+    return p as string;
+}
+fn u24le(v: int): string {
+    let p = bytes.alloc(3);
+    bytes.write_byte(p, 0, v % 256);
+    bytes.write_byte(p, 1, (v / 256) % 256);
+    bytes.write_byte(p, 2, (v / 65536) % 256);
+    return p as string;
+}
+fn u32le(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, v % 256);
+    bytes.write_byte(p, 1, (v / 256) % 256);
+    bytes.write_byte(p, 2, (v / 65536) % 256);
+    bytes.write_byte(p, 3, (v / 16777216) % 256);
+    return p as string;
+}
+fn cstr(s: string): string { return s + u8b(0); }
+// lenenc string: a length-encoded-int length + the bytes (v1 handles the < 251 length only,
+// which covers usernames and auth responses; larger payloads would use the 0xfc/fd/fe forms).
+fn lenencStr(s: string): string { return u8b(s.length) + s; }
+fn zeros(n: int): string {
+    let p = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(p, i, 0); i = i + 1; }
+    return p as string;
+}
+
+// A MySQL packet: [payload_len:u24 LE][seq:u8][payload].
+fn packet(seq: int, payload: string): string {
+    return u24le(payload.length) + u8b(seq) + payload;
+}
+
+/// COM_QUERY (0x03) + SQL. Sequence id resets to 0 for a new command.
+pub fn buildComQuery(sql: string): string {
+    return packet(0, u8b(3) + sql);
+}
+
+/// HandshakeResponse41: capabilities, max-packet, charset, 23 filler, user, auth response
+/// (lenenc byte + scramble), database, auth-plugin-name. Sequence id 1 (server handshake = 0).
+pub fn buildHandshakeResponse(user: string, database: string, scramble: string, plugin: string): string {
+    let body = u32le(clientCapabilities())
+        + u32le(16777216)         // max packet 16MB
+        + u8b(45)                 // charset utf8mb4_general_ci
+        + zeros(23)
+        + cstr(user)
+        + lenencStr(scramble)     // SECURE_CONNECTION: 1-byte length + scramble
+        + cstr(database)
+        + cstr(plugin);
+    return packet(1, body);
+}
+
+// --- Payload cursor (decode, pure over a byte-buffer string) ------------------
+struct MyCursor {
+    pub s: string,
+    pub pos: int,
+    init(s: string) { self.s = s; self.pos = 0; }
+
+    pub fn byte(self: MyCursor): int {
+        let b = self.s[self.pos];
+        self.pos = self.pos + 1;
+        return b;
+    }
+    pub fn u16(self: MyCursor): int {
+        let a = self.byte();
+        let b = self.byte();
+        return a + b * 256;
+    }
+    pub fn u32(self: MyCursor): int {
+        let a = self.byte();
+        let b = self.byte();
+        let c = self.byte();
+        let d = self.byte();
+        return a + b * 256 + c * 65536 + d * 16777216;
+    }
+    // length-encoded integer.
+    pub fn lenenc(self: MyCursor): int {
+        let first = self.byte();
+        if (first < 251) { return first; }
+        if (first == 252) { return self.u16(); }
+        if (first == 253) {
+            let a = self.byte(); let b = self.byte(); let c = self.byte();
+            return a + b * 256 + c * 65536;
+        }
+        // 254: 8-byte LE.
+        let v = 0; let mul = 1; let i = 0;
+        while (i < 8) { v = v + self.byte() * mul; mul = mul * 256; i = i + 1; }
+        return v;
+    }
+    pub fn take(self: MyCursor, n: int): string {
+        let out = string.slice(self.s, self.pos, self.pos + n);
+        self.pos = self.pos + n;
+        return out;
+    }
+    // length-encoded string.
+    pub fn lenencStr(self: MyCursor): string {
+        let n = self.lenenc();
+        return self.take(n);
+    }
+    pub fn cstr(self: MyCursor): string {
+        let start = self.pos;
+        while (self.s[self.pos] != 0) { self.pos = self.pos + 1; }
+        let out = string.slice(self.s, start, self.pos);
+        self.pos = self.pos + 1;
+        return out;
+    }
+    pub fn skip(self: MyCursor, n: int): void { self.pos = self.pos + n; }
+    pub fn remaining(self: MyCursor): int { return self.s.length - self.pos; }
+}
+
+/// The server Handshake (protocol v10): version, server-version(cstr), conn-id(u32),
+/// auth-data-1(8), filler, cap-low(u16), charset(u8), status(u16), cap-high(u16),
+/// auth-data-len(u8), reserved(10), auth-data-2, auth-plugin-name(cstr). Returns the 20-byte
+/// salt (data1 ++ data2, trimmed) + the plugin name.
+struct Handshake {
+    pub salt: string,
+    pub plugin: string,
+    init(salt: string, plugin: string) { self.salt = salt; self.plugin = plugin; }
+}
+pub fn parseHandshake(payload: string): Handshake {
+    let c = MyCursor(payload);
+    c.skip(1);            // protocol version (10)
+    let sv = c.cstr();    // server version
+    c.skip(4);            // connection id
+    let salt1 = c.take(8);
+    c.skip(1);            // filler 0
+    c.skip(2);            // capability flags lower
+    c.skip(1);            // character set
+    c.skip(2);            // status flags
+    c.skip(2);            // capability flags upper
+    let authLen = c.byte();  // length of auth-plugin-data
+    c.skip(10);           // reserved
+    // auth-data part 2: max(13, authLen - 8) bytes, but the last byte is a NUL — take 12.
+    let part2len = 12;
+    if (authLen > 21) { part2len = authLen - 8 - 1; }
+    let salt2 = c.take(part2len);
+    let plugin = "mysql_native_password";
+    if (c.remaining() > 0) { plugin = c.cstr(); }
+    return Handshake(salt1 + salt2, plugin);
+}
+
+// --- Result decoders ----------------------------------------------------------
+
+/// Column Definition (v41): catalog/schema/table/org_table/name/org_name (lenenc-str each),
+/// then a fixed block: len-of-fixed(lenenc,=0x0c), charset(u16), col_len(u32), type(u8),
+/// flags(u16), decimals(u8), filler(u16). We keep name + type -> typed Column.
+pub fn decodeColumnDef(payload: string): Column {
+    let c = MyCursor(payload);
+    c.lenencStr();        // catalog "def"
+    c.lenencStr();        // schema
+    c.lenencStr();        // table
+    c.lenencStr();        // org_table
+    let name = c.lenencStr();
+    c.lenencStr();        // org_name
+    c.lenenc();           // length of fixed-length fields (0x0c)
+    c.skip(2);            // charset
+    c.skip(4);            // column length
+    let t = c.byte();     // column type
+    return Column(name, typeToDbType(t));
+}
+
+fn decodeCell(t: DbType, raw: string, isNull: bool): DbValue {
+    if (isNull) { return db.dbNull(); }
+    if (t == DbType.Bool) {
+        return db.dbBool(string.eql(raw, "1") || string.eql(raw, "t") || string.eql(raw, "true"));
+    }
+    if (t == DbType.Int4 || t == DbType.Uint4) { return db.dbInt(string.parseI64(raw)); }
+    if (t == DbType.Int8 || t == DbType.Uint8 || t == DbType.Timestamp) { return db.dbLong(string.parseI64(raw)); }
+    if (t == DbType.Float4 || t == DbType.Float8) { return db.dbDouble(string.parseFloat(raw)); }
+    if (t == DbType.Decimal) { return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(raw), raw); } // S4: exact .dec
+    return db.dbText(raw);
+}
+
+/// A text-protocol result row: for each column, a lenenc-str, or 0xfb = NULL.
+pub fn decodeTextRow(payload: string, cols: List<Column>): Row {
+    let row = Row();
+    let c = MyCursor(payload);
+    let n = cols.size();
+    let i = 0;
+    while (i < n) {
+        let col = cols.get(i) ?? Column("", DbType.Text);
+        let marker = c.byte();
+        if (marker == 251) {                 // 0xfb = NULL
+            row.cells.push(decodeCell(col.type_oid, "", true));
+        } else {
+            // `marker` is the first byte of the value's lenenc length; decode the rest.
+            let len = marker;
+            if (marker == 252) { len = c.u16(); }
+            else if (marker == 253) { let a = c.byte(); let b = c.byte(); let cc = c.byte(); len = a + b * 256 + cc * 65536; }
+            else if (marker == 254) { len = 0; let mul = 1; let k = 0; while (k < 8) { len = len + c.byte() * mul; mul = mul * 256; k = k + 1; } }
+            row.cells.push(decodeCell(col.type_oid, c.take(len), false));
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+// ============================================================================
+// D6: server-side prepared statements — the MySQL binary protocol (COM_STMT_*).
+// ============================================================================
+
+// A prepared statement: server statement id, SQL (for the dedup cache), the result columns +
+// their RAW MySQL type bytes (the binary row decoder needs the exact wire type, which the seam
+// DbType loses — TINY/SHORT/LONG all map to Int4), and the parameter count.
+struct MyStmt {
+    pub id: int,
+    pub sql: string,
+    pub cols: List<Column>,
+    pub colTypes: List<int>,   // raw MySQL type | (unsigned ? 256 : 0)
+    pub numParams: int,
+    init(id: int, sql: string, cols: List<Column>, colTypes: List<int>, numParams: int) {
+        self.id = id; self.sql = sql; self.cols = cols; self.colTypes = colTypes; self.numParams = numParams;
+    }
+}
+
+// The raw MySQL column type byte plus its UNSIGNED flag, packed as `type | (unsigned<<8)`. Reads
+// the same column-definition packet as decodeColumnDef but keeps the wire type (+ flags), which
+// the binary protocol needs to size each value.
+fn columnTypeRaw(payload: string): int {
+    let c = MyCursor(payload);
+    c.lenencStr(); c.lenencStr(); c.lenencStr(); c.lenencStr(); c.lenencStr(); c.lenencStr(); // strings
+    c.lenenc();           // 0x0c
+    c.skip(2);            // charset
+    c.skip(4);            // column length
+    let t = c.byte();     // type
+    let flags = c.u16();  // flags — UNSIGNED_FLAG = 0x20 (32)
+    let uns = if ((flags / 32) % 2 == 1) 256 else 0;
+    return t + uns;
+}
+
+// lenenc integer (full: <251 one byte, else 0xfc/0xfd/0xfe forms).
+fn lenencInt(v: int): string {
+    if (v < 251) { return u8b(v); }
+    if (v < 65536) { return u8b(252) + u8b(v % 256) + u8b((v / 256) % 256); }
+    if (v < 16777216) { return u8b(253) + u24le(v); }
+    return u8b(254) + u32le(v) + u32le(0);
+}
+fn lenencStrFull(s: string): string { return lenencInt(s.length) + s; }
+
+// A bound parameter's value as TEXT (the driver sends every param as MYSQL_TYPE_VAR_STRING and
+// lets the server coerce to the column type — the binary analogue of PG's text-format Bind).
+fn valueToBindText(v: DbValue): string {
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "1"; } return "0"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return v.asText(); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) { let d = v.asDouble(); return `${d}`; }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+
+// COM_STMT_PREPARE (0x16) + SQL.
+pub fn buildStmtPrepare(sql: string): string { return packet(0, u8b(22) + sql); }
+// COM_STMT_CLOSE (0x19) + statement id.
+fn buildStmtClose(stmtId: int): string { return packet(0, u8b(25) + u32le(stmtId)); }
+
+// COM_STMT_EXECUTE (0x17): stmt_id, flags=0 (no cursor), iteration_count=1, then — if there are
+// params — the NULL bitmap, new-params-bound=1, each param's type (VAR_STRING), then each
+// non-null param value as a lenenc string.
+pub fn buildStmtExecute(stmtId: int, params: List<DbValue>): string {
+    let np = params.size();
+    let body = u8b(23) + u32le(stmtId) + u8b(0) + u32le(1);
+    if (np > 0) {
+        let nbytes = (np + 7) / 8;
+        let nullmap = bytes.alloc(nbytes);
+        let k = 0;
+        while (k < nbytes) { bytes.write_byte(nullmap, k, 0); k = k + 1; }
+        let i = 0;
+        while (i < np) {
+            let p = params.get(i) ?? db.dbNull();
+            if (p.isNull()) {
+                let cur = bytes.read_byte(nullmap, i / 8);
+                bytes.write_byte(nullmap, i / 8, cur | (1 << (i % 8)));
+            }
+            i = i + 1;
+        }
+        let nmStr = nullmap as string;                 // owned local so the buffer is freed (not leaked)
+        body = body + nmStr + u8b(1);                  // bitmap + new_params_bound_flag
+        i = 0;
+        while (i < np) { body = body + u8b(253) + u8b(0); i = i + 1; }   // all params VAR_STRING
+        i = 0;
+        while (i < np) {
+            let p = params.get(i) ?? db.dbNull();
+            if (!p.isNull()) { body = body + lenencStrFull(valueToBindText(p)); }
+            i = i + 1;
+        }
+    }
+    return packet(0, body);
+}
+
+// Read `n` little-endian bytes into a 64-bit value.
+fn readLE(c: MyCursor, n: int): long {
+    let v: long = 0;
+    let mul: long = 1;
+    let i = 0;
+    while (i < n) { v = v + (c.byte() as long) * mul; mul = mul * 256; i = i + 1; }
+    return v;
+}
+// Two's-complement sign-extend a `width`-byte unsigned value.
+fn signExtend(v: long, width: int): long {
+    let bits: long = (width as long) * 8;
+    let half: long = 1;
+    let i = 0;
+    while (i < bits - 1) { half = half * 2; i = i + 1; }   // 2^(bits-1)
+    if (v >= half) { return v - half - half; }
+    return v;
+}
+
+// Decode ONE binary-protocol value for a column of raw type `tf` (type | unsigned<<8).
+fn decodeBinaryCell(c: MyCursor, tf: int): DbValue {
+    let t = tf % 256;
+    let uns = tf >= 256;
+    if (t == 1) {                                   // TINY (1 byte)
+        let v = readLE(c, 1);
+        return db.dbInt((if (uns) v else signExtend(v, 1)) as int);
+    }
+    if (t == 2 || t == 13) {                        // SHORT / YEAR (2 bytes)
+        let v = readLE(c, 2);
+        return db.dbInt((if (uns) v else signExtend(v, 2)) as int);
+    }
+    if (t == 3 || t == 9) {                         // LONG / INT24 (4 bytes)
+        let v = readLE(c, 4);
+        return db.dbLong(if (uns) v else signExtend(v, 4));
+    }
+    if (t == 8) {                                   // LONGLONG (8 bytes)
+        let v = readLE(c, 8);
+        return db.dbLong(v);                        // (unsigned > i63 wraps — MySQL edge case)
+    }
+    if (t == 4) {                                   // FLOAT (4 IEEE bytes)
+        let raw = c.take(4);
+        return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(raw, 4)));
+    }
+    if (t == 5) {                                   // DOUBLE (8 IEEE bytes)
+        let raw = c.take(8);
+        return db.dbDouble(string.parseFloat(nova_ieee_le_to_str(raw, 8)));
+    }
+    if (t == 0 || t == 246) {                       // DECIMAL / NEWDECIMAL (lenenc text)
+        let s = c.lenencStr();
+        return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(s), s);
+    }
+    if (t == 10 || t == 7 || t == 12) {             // DATE / TIMESTAMP / DATETIME (binary)
+        return db.dbText(decodeBinaryDateTime(c));
+    }
+    // STRING / VAR_STRING / VARCHAR / BLOB / JSON / etc. -> lenenc string
+    return db.dbText(c.lenencStr());
+}
+
+// Binary DATE/DATETIME/TIMESTAMP: a lenenc length (0/4/7/11) then year(2) month(1) day(1)
+// [hour(1) min(1) sec(1)] [microsec(4)] -> "YYYY-MM-DD HH:MM:SS".
+fn decodeBinaryDateTime(c: MyCursor): string {
+    let len = c.lenenc();
+    if (len == 0) { return "0000-00-00"; }
+    let year = c.u16();
+    let month = c.byte();
+    let day = c.byte();
+    let hour = 0; let min = 0; let sec = 0;
+    if (len >= 7) { hour = c.byte(); min = c.byte(); sec = c.byte(); }
+    if (len >= 11) { c.skip(4); }   // microseconds (dropped)
+    let d = `${year}-${pad2(month)}-${pad2(day)}`;
+    if (len >= 7) { return `${d} ${pad2(hour)}:${pad2(min)}:${pad2(sec)}`; }
+    return d;
+}
+fn pad2(v: int): string { if (v < 10) { return `0${v}`; } return `${v}`; }
+
+// A binary-protocol result row: 0x00 header, NULL bitmap ((ncols+9)/8 bytes, offset by 2 bits),
+// then a binary value for each non-null column.
+pub fn decodeBinaryRow(payload: string, cols: List<Column>, types: List<int>): Row {
+    let row = Row();
+    let c = MyCursor(payload);
+    c.skip(1);                          // 0x00 packet header
+    let ncols = cols.size();
+    let nbytes = (ncols + 7 + 2) / 8;
+    let nullmap = c.take(nbytes);
+    let i = 0;
+    while (i < ncols) {
+        let bitpos = i + 2;
+        let nb = bytes.read_byte(nullmap, bitpos / 8);
+        let isNull = ((nb / (1 << (bitpos % 8))) % 2) == 1;
+        if (isNull) {
+            row.cells.push(db.dbNull());
+        } else {
+            row.cells.push(decodeBinaryCell(c, types.get(i) ?? 253));
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+/// ERR packet (first byte 0xff): error_code(u16), sql_state_marker('#')+sql_state(5),
+/// error_message(rest).
+pub fn decodeErr(payload: string): DbError {
+    let c = MyCursor(payload);
+    c.skip(1);            // 0xff
+    c.u16();              // error code
+    let code = "";
+    if (c.remaining() > 0 && c.s[c.pos] == 35) {   // '#'
+        c.skip(1);
+        code = c.take(5);
+    }
+    let msg = c.take(c.remaining());
+    return DbError(code, msg);
+}
+
+// An OK packet reports affected_rows (lenenc) + last_insert_id (lenenc). First byte 0x00.
+fn okAffectedRows(payload: string): int {
+    let c = MyCursor(payload);
+    c.skip(1);            // 0x00
+    return c.lenenc();
+}
+
+// --- Buffered packet reader over a live TCP stream ----------------------------
+struct MyReader {
+    pub io: asyncio.AsyncStream,   // A1 async-first: fill awaits io.recvInto (parks, no thread held)
+    pub buf: ptr,
+    pub cap: int,
+    pub len: int,
+    pub pos: int,
+    init(io: asyncio.AsyncStream) {
+        self.io = io;
+        self.cap = 65536;
+        self.buf = bytes.alloc(65536);
+        self.len = 0;
+        self.pos = 0;
+    }
+
+    // `buf` is a raw `ptr`, not an ARC-managed field, so ARC won't free it — the
+    // destructor must (else the 64KB read buffer leaks per connection). Mirrors
+    // BtReader.delete.
+    fn delete(self: MyReader): void {
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+            self.buf = 0;
+        }
+    }
+}
+async fn fill(r: MyReader): bool {
+    if (r.pos > 0) {
+        let i = 0;
+        while (r.pos + i < r.len) {
+            bytes.write_byte(r.buf, i, bytes.read_byte(r.buf, r.pos + i));
+            i = i + 1;
+        }
+        r.len = r.len - r.pos;
+        r.pos = 0;
+    }
+    let space = r.cap - r.len;
+    let n = await r.io.recvInto((r.buf + r.len) as int, space);   // parks the coroutine
+    if (n <= 0) { return false; }
+    r.len = r.len + n;
+    return true;
+}
+async fn need(r: MyReader, k: int): bool {
+    while (r.len - r.pos < k) { if (!(await fill(r))) { return false; } }
+    return true;
+}
+fn rbyte(r: MyReader): int { let b = bytes.read_byte(r.buf, r.pos); r.pos = r.pos + 1; return b; }
+
+// A whole MySQL packet payload (header stripped). Returns "" with ok=false at EOF.
+struct Packet {
+    pub payload: string,
+    pub ok: bool,
+    pub seq: int,
+    init(payload: string, ok: bool) { self.payload = payload; self.ok = ok; self.seq = 0; }
+}
+async fn readPacket(r: MyReader): Packet {
+    if (!(await need(r, 4))) { return Packet("", false); }
+    let a = rbyte(r); let b = rbyte(r); let c = rbyte(r);
+    let plen = a + b * 256 + c * 65536;
+    let seq = rbyte(r);
+    if (plen > 0) { if (!(await need(r, plen))) { return Packet("", false); } }
+    let out = bytes.alloc(plen);
+    let i = 0;
+    while (i < plen) { bytes.write_byte(out, i, bytes.read_byte(r.buf, r.pos + i)); i = i + 1; }
+    r.pos = r.pos + plen;
+    // Bind the `as string` cast to a local so it's registered as an owned temporary —
+    // an inline `out as string` as a constructor arg is NOT tracked as owned, so the
+    // packet payload leaked (same ARC-edge as the BtReader fix).
+    let payload = out as string;
+    let pk = Packet(payload, true);
+    pk.seq = seq;
+    return pk;
+}
+
+async fn sendPacket(io: asyncio.AsyncStream, frame: string): int {
+    return await io.sendStr(frame);
+}
+
+// Is this result packet an end-of-stream EOF? (0xfe first byte, payload < 9 bytes).
+fn isEof(p: string): bool { return p.length > 0 && p.length < 9 && p[0] == 254; }
+fn isErr(p: string): bool { return p.length > 0 && p[0] == 255; }
+fn isOk(p: string): bool { return p.length > 0 && p[0] == 0; }
+
+// --- The seam implementation --------------------------------------------------
+
+pub struct MyConnection impl Connection {
+    pub io: asyncio.AsyncStream,
+    pub reader: MyReader,
+    pub stmts: List<MyStmt>,   // D6: server-side prepared-statement cache (COM_STMT_*)
+    init(io: asyncio.AsyncStream, reader: MyReader) {
+        self.io = io;
+        self.reader = reader;
+        self.stmts = List<MyStmt>();
+    }
+
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        await sendPacket(self.io, buildComQuery(substituteParams(sql, params)));
+        let rs = ResultSet();
+        let first = await readPacket(self.reader);
+        if (!first.ok) { return rs; }
+        if (isErr(first.payload)) { rs.tag = "ERROR"; return rs; }
+        if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); return rs; }
+
+        // first.payload = column_count (lenenc).
+        let cc = MyCursor(first.payload);
+        let ncols = cc.lenenc();
+        let i = 0;
+        while (i < ncols) {
+            let cp = await readPacket(self.reader);
+            if (!cp.ok) { return rs; }
+            rs.columns.push(decodeColumnDef(cp.payload));
+            i = i + 1;
+        }
+        // EOF after column defs.
+        let eof1 = await readPacket(self.reader);
+        // Rows until EOF.
+        while (true) {
+            let rp = await readPacket(self.reader);
+            if (!rp.ok) { break; }
+            if (isEof(rp.payload) || isErr(rp.payload)) { break; }
+            rs.rows.push(decodeTextRow(rp.payload, rs.columns));
+        }
+        rs.rows_affected = rs.rows.size();
+        rs.tag = `SELECT ${rs.rows.size()}`;
+        return rs;
+    }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        await sendPacket(self.io, buildComQuery(substituteParams(sql, params)));
+        let p = await readPacket(self.reader);
+        if (!p.ok) { return ExecResult(0, "ERROR"); }
+        if (isErr(p.payload)) { return ExecResult(0, "ERROR"); }
+        if (isOk(p.payload)) { return ExecResult(okAffectedRows(p.payload), "OK"); }
+        // A result set slipped through (SELECT via exec); drain to ReadyForQuery-equivalent.
+        return ExecResult(0, "OK");
+    }
+
+    pub fn close(self): void {
+        // sync trait method: close the socket (a graceful COM_QUIT would need an async send;
+        // an abrupt close is fine for teardown).
+        self.io.close();
+    }
+
+    pub fn setTimeout(self, ms: int): int {   // D6 — async per-recv awaited deadline
+        return self.io.setTimeout(ms);
+    }
+
+    // D6 prepared statements — REAL server-side (COM_STMT_PREPARE / COM_STMT_EXECUTE, binary
+    // protocol). `prepare` parses the SQL once server-side and caches its id + result-column
+    // metadata (deduped by SQL); `queryPrepared`/`execPrepared` bind params + run it.
+    pub async fn prepare(self, sql: string): int {
+        let d = 0;
+        while (d < self.stmts.size()) {
+            let s = self.stmts.get(d) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+            if (string.eql(s.sql, sql)) { return d; }
+            d = d + 1;
+        }
+        await sendPacket(self.io, buildStmtPrepare(sql));
+        let ok = await readPacket(self.reader);
+        // COM_STMT_PREPARE_OK: 0x00, stmt_id(4), num_columns(2), num_params(2), 0x00, warnings(2).
+        if (!ok.ok || isErr(ok.payload)) { return -1; }
+        let oc = MyCursor(ok.payload);
+        oc.skip(1);
+        let stmtId = oc.u32();
+        let numCols = oc.u16();
+        let numParams = oc.u16();
+        // Param definition packets (numParams) + EOF, then column defs (numCols) + EOF. This
+        // build does not set CLIENT_DEPRECATE_EOF, so the EOF packets are present.
+        let pi = 0;
+        while (pi < numParams) { let pp = await readPacket(self.reader); pi = pi + 1; }
+        if (numParams > 0) { let e1 = await readPacket(self.reader); }
+        let cols = List<Column>();
+        let colTypes = List<int>();
+        let ci = 0;
+        while (ci < numCols) {
+            let cp = await readPacket(self.reader);
+            cols.push(decodeColumnDef(cp.payload));
+            colTypes.push(columnTypeRaw(cp.payload));
+            ci = ci + 1;
+        }
+        if (numCols > 0) { let e2 = await readPacket(self.reader); }
+        let idx = self.stmts.size();
+        self.stmts.push(MyStmt(stmtId, sql, cols, colTypes, numParams));
+        return idx;
+    }
+
+    pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        let rs = ResultSet();
+        if (stmt < 0 || stmt >= self.stmts.size()) { return rs; }
+        let s = self.stmts.get(stmt) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        await sendPacket(self.io, buildStmtExecute(s.id, params));
+        let first = await readPacket(self.reader);
+        if (!first.ok) { return rs; }
+        if (isErr(first.payload)) { rs.tag = "ERROR"; return rs; }
+        if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); return rs; }
+        // column_count(lenenc), then column defs + EOF, then BINARY rows until EOF.
+        let cc = MyCursor(first.payload);
+        let ncols = cc.lenenc();
+        let cols = List<Column>();
+        let colTypes = List<int>();
+        let i = 0;
+        while (i < ncols) {
+            let cp = await readPacket(self.reader);
+            cols.push(decodeColumnDef(cp.payload));
+            colTypes.push(columnTypeRaw(cp.payload));
+            i = i + 1;
+        }
+        rs.columns = cols;
+        let eof1 = await readPacket(self.reader);
+        while (true) {
+            let rp = await readPacket(self.reader);
+            if (!rp.ok) { break; }
+            if (isEof(rp.payload) || isErr(rp.payload)) { break; }
+            rs.rows.push(decodeBinaryRow(rp.payload, rs.columns, colTypes));
+        }
+        rs.rows_affected = rs.rows.size();
+        rs.tag = `SELECT ${rs.rows.size()}`;
+        return rs;
+    }
+
+    pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
+        if (stmt < 0 || stmt >= self.stmts.size()) { return ExecResult(0, ""); }
+        let s = self.stmts.get(stmt) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        await sendPacket(self.io, buildStmtExecute(s.id, params));
+        let p = await readPacket(self.reader);
+        if (!p.ok || isErr(p.payload)) { return ExecResult(0, "ERROR"); }
+        if (isOk(p.payload)) { return ExecResult(okAffectedRows(p.payload), "OK"); }
+        // A result set (SELECT via execPrepared): drain column defs + rows to keep the stream aligned.
+        let cc = MyCursor(p.payload);
+        let ncols = cc.lenenc();
+        let i = 0;
+        while (i < ncols) { let cp = await readPacket(self.reader); i = i + 1; }
+        let eof1 = await readPacket(self.reader);
+        while (true) {
+            let rp = await readPacket(self.reader);
+            if (!rp.ok) { break; }
+            if (isEof(rp.payload) || isErr(rp.payload)) { break; }
+        }
+        return ExecResult(0, "OK");
+    }
+}
+
+fn escapeText(s: string): string {
+    let out = "'";
+    let i = 0;
+    let n = s.length;
+    while (i < n) {
+        let ch = s[i];
+        if (ch == 39) { out = out + "''"; }        // ' -> ''
+        else if (ch == 92) { out = out + "\\\\"; } // \ -> \\  (MySQL backslash escaping)
+        else { out = out + string.slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out + "'";
+}
+fn valueToSql(v: DbValue): string {
+    if (v.isNull()) { return "NULL"; }
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "1"; } return "0"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return escapeText(v.asText()); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) { let d = v.asDouble(); return `${d}`; }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+pub fn substituteParams(sql: string, params: List<DbValue>): string {
+    let out = "";
+    let i = 0;
+    let n = sql.length;
+    while (i < n) {
+        if (sql[i] == 36 && i + 1 < n) {    // '$'
+            let d = sql[i + 1];
+            if (d >= 49 && d <= 57) {
+                let p = params.get(d - 49) ?? db.dbNull();
+                out = out + valueToSql(p);
+                i = i + 2;
+            } else {
+                out = out + "$";
+                i = i + 1;
+            }
+        } else {
+            out = out + string.slice(sql, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// The MySQL driver. DSN: `mysql://user[:password]@host[:port]/database`. Reads the server
+/// Handshake, computes the auth response (native_password SHA1, or caching_sha2 fast SHA256),
+/// sends HandshakeResponse41, and expects an OK packet.
+// Whole connect + auth handshake as ONE async fn, driven once by the sync Driver.connect.
+async fn myConnectAsync(dsn: string): MyConnection {
+        let d = parseDsn(dsn);
+        let stream = await asyncio.asyncConnect(d.host, d.port);
+        let reader = MyReader(stream);
+
+        let hp = await readPacket(reader);
+        let hs = parseHandshake(hp.payload);
+
+        // Compute the scramble for the server's chosen auth plugin. An EMPTY password
+        // MUST send an empty scramble (a 0-length auth response) — the server then
+        // fast-accepts an empty-password account; a computed 32-byte scramble would
+        // fail auth.
+        let scramble = "";
+        if (d.password.length > 0) {
+            if (string.eql(hs.plugin, "caching_sha2_password")) {
+                scramble = mysqlSha2Scramble(d.password, hs.salt);
+            } else {
+                scramble = mysqlNativeScramble(d.password, hs.salt);
+            }
+        }
+        await sendPacket(stream, buildHandshakeResponse(d.user, d.database, scramble, hs.plugin));
+
+        // `activeSalt` is the nonce the current auth response was computed against — it is also
+        // what the RSA full-auth path XORs the password with, so it must track any AuthSwitch.
+        let activeSalt = hs.salt;
+
+        // Read the auth result. For caching_sha2_password the server may reply with
+        // AuthMoreData (0x01): 0x03 = fast-auth success (followed by the real OK),
+        // 0x04 = full auth required (RSA-encrypted password, handled below).
+        let ar = await readPacket(reader);
+
+        // AuthSwitchRequest (0xfe): the server names the plugin it wants + a fresh
+        // 20-byte salt; re-scramble against THAT and reply (seq+1). MySQL 8/9 sends
+        // this for caching_sha2_password.
+        if (ar.payload.length > 0 && bytes.read_byte(ar.payload, 0) == 254) {
+            let sc = MyCursor(ar.payload);
+            sc.skip(1);
+            let swPlugin = sc.cstr();
+            let swSalt = sc.take(20);
+            activeSalt = swSalt;
+            let sw = "";
+            if (d.password.length > 0) {
+                if (string.eql(swPlugin, "caching_sha2_password")) {
+                    sw = mysqlSha2Scramble(d.password, swSalt);
+                } else {
+                    sw = mysqlNativeScramble(d.password, swSalt);
+                }
+            }
+            await sendPacket(stream, packet(ar.seq + 1, sw));
+            ar = await readPacket(reader);
+        }
+
+        // caching_sha2 AuthMoreData (0x01): byte[1] selects the sub-path.
+        //   0x03 = fast-auth success -> the real OK follows.
+        //   0x04 = full auth required (password not in the server's cache). Over a plaintext
+        //          channel: request the server's RSA public key (0x02), then send the password
+        //          XOR-nonce, RSA-OAEP-encrypted under that key.
+        if (ar.payload.length > 1 && bytes.read_byte(ar.payload, 0) == 1) {
+            let more = bytes.read_byte(ar.payload, 1);
+            if (more == 4) {
+                await sendPacket(stream, packet(ar.seq + 1, u8b(2)));   // 0x02: request RSA public key
+                let pk = await readPacket(reader);                       // AuthMoreData(0x01) + PEM
+                let pem = string.slice(pk.payload, 1, pk.payload.length);
+                let enc = rsaEncryptPassword(d.password, activeSalt, pem);
+                await sendPacket(stream, packet(pk.seq + 1, enc));
+                let ok = await readPacket(reader);                       // OK (or ERR)
+            } else {
+                let after = await readPacket(reader);                    // 0x03 fast success -> real OK
+            }
+        }
+        return MyConnection(stream, reader);
+}
+
+pub struct MyDriver impl Driver {
+    pub async fn connect(self, dsn: string): Connection {
+        return await myConnectAsync(dsn);   // sync trait method drives the async connect once
+    }
+}
+
+struct MyDsn {
+    pub host: string,
+    pub port: int,
+    pub user: string,
+    pub password: string,
+    pub database: string,
+    init(host: string, port: int, user: string, password: string, database: string) {
+        self.host = host; self.port = port; self.user = user;
+        self.password = password; self.database = database;
+    }
+}
+fn parseDsn(dsn: string): MyDsn {
+    let s = dsn;
+    let scheme = string.indexOf(s, "://");
+    if (scheme != -1) { s = string.slice(s, scheme + 3, s.length); }
+
+    let user = "root";
+    let password = "";
+    let at = string.lastIndexOf(s, "@");
+    if (at != -1) {
+        let cred = string.slice(s, 0, at);
+        s = string.slice(s, at + 1, s.length);
+        let colon = string.indexOf(cred, ":");
+        if (colon == -1) { user = cred; }
+        else { user = string.slice(cred, 0, colon); password = string.slice(cred, colon + 1, cred.length); }
+    }
+    let database = "";
+    let slash = string.indexOf(s, "/");
+    if (slash != -1) {
+        database = string.slice(s, slash + 1, s.length);
+        s = string.slice(s, 0, slash);
+    }
+    let host = s;
+    let port = 3306;
+    let pc = string.lastIndexOf(s, ":");
+    if (pc != -1) {
+        host = string.slice(s, 0, pc);
+        port = string.parseI64(string.slice(s, pc + 1, s.length));
+    }
+    return MyDsn(host, port, user, password, database);
+}
