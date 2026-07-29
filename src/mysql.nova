@@ -20,22 +20,44 @@ import bytes;
 import string;
 import list;
 import db;
+import crypto.hash.sha;
+import crypto.rsa;
 
-// MySQL auth-response scrambles. These are protocol-specific obfuscations (NOT
-// general cryptography), so they live with the driver rather than in crypto/ —
-// they wrap the raw runtime primitives directly.
+// MySQL auth-response scrambles, in pure Nova over the crypto/hash primitives (no runtime shim).
+// These are protocol-specific obfuscations (NOT general cryptography):
 //
-//   native: SHA1(pw) XOR SHA1(salt ++ SHA1(SHA1(pw)))  (20 raw bytes)
+//   native: SHA1(pw) XOR SHA1(salt ++ SHA1(SHA1(pw)))          (20 raw bytes)
 //   sha2:   SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) ++ salt)  (32 raw bytes)
 //
 // `salt` is the server's scramble; the result is binary (may contain NULs).
 // Public so the driver's codec gate can golden-verify them; not general crypto.
+fn catBytes(a: string, b: string): string {
+    let out = bytes.alloc(a.length + b.length);
+    let i = 0;
+    while (i < a.length) { bytes.write_byte(out, i, bytes.read_byte(a as ptr, i)); i = i + 1; }
+    let j = 0;
+    while (j < b.length) { bytes.write_byte(out, a.length + j, bytes.read_byte(b as ptr, j)); j = j + 1; }
+    return out as string;
+}
+
 pub fn mysqlNativeScramble(password: string, salt: string): string {
-    return nova_mysql_scramble(password, salt, salt.length);
+    let stage1 = sha.sha1Raw(password);                 // SHA1(pw)
+    let stage2 = sha.sha1Raw(stage1);                   // SHA1(SHA1(pw))
+    let seed = sha.sha1Raw(catBytes(salt, stage2));     // SHA1(salt ++ stage2)
+    let out = bytes.alloc(20);
+    let i = 0;
+    while (i < 20) { bytes.write_byte(out, i, bytes.read_byte(stage1 as ptr, i) ^ bytes.read_byte(seed as ptr, i)); i = i + 1; }
+    return out as string;
 }
 
 pub fn mysqlSha2Scramble(password: string, salt: string): string {
-    return nova_mysql_sha2_scramble(password, salt, salt.length);
+    let stage1 = sha.sha256Raw(password);               // SHA256(pw)
+    let stage2 = sha.sha256Raw(stage1);                 // SHA256(SHA256(pw))
+    let seed = sha.sha256Raw(catBytes(stage2, salt));   // SHA256(stage2 ++ salt)
+    let out = bytes.alloc(32);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, i, bytes.read_byte(stage1 as ptr, i) ^ bytes.read_byte(seed as ptr, i)); i = i + 1; }
+    return out as string;
 }
 
 // D6: caching_sha2_password FULL auth (uncached password over a plaintext channel). The client
@@ -53,7 +75,7 @@ fn rsaEncryptPassword(password: string, salt: string, pem: string): string {
         i = i + 1;
     }
     let xored = buf as string;                 // length-n Nova string (may contain NULs)
-    return nova_rsa_oaep_encrypt(pem, xored, n);
+    return rsa.oaepEncryptSha1(pem, xored, n);
 }
 
 // --- Capability flags (client) ------------------------------------------------
