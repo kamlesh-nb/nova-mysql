@@ -127,3 +127,13 @@ fn test_ssl_request_frame(): void {
     // caps u32le starts at byte 4; CLIENT_SSL (0x800) is bit 3 of byte 5.
     assert.equalInt(f[5] & 8, 8);
 }
+
+@test
+fn test_text_datetime_decode(): void {
+    // T3: a DATETIME column (text protocol) keeps its string instead of being parseI64'd to the year.
+    let cols = List<Column>();
+    cols.push(Column("ts", DbType.Timestamp));
+    let rp = lstr("2024-01-01 10:00:00");
+    let row = mysql.decodeTextRow(rp, cols);
+    assert.equalStr(row.getTimestamp(0), "2024-01-01 10:00:00");
+}

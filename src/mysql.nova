@@ -293,7 +293,10 @@ fn decodeCell(t: DbType, raw: string, isNull: bool): DbValue {
         return db.dbBool(string.eql(raw, "1") || string.eql(raw, "t") || string.eql(raw, "true"));
     }
     if (t == DbType.Int4 || t == DbType.Uint4) { return db.dbInt(string.parseI64(raw)); }
-    if (t == DbType.Int8 || t == DbType.Uint8 || t == DbType.Timestamp) { return db.dbLong(string.parseI64(raw)); }
+    if (t == DbType.Int8 || t == DbType.Uint8) { return db.dbLong(string.parseI64(raw)); }
+    // Temporal (text protocol) arrives as "YYYY-MM-DD HH:MM:SS"; keep it verbatim. The old code grouped
+    // it with Int8 and ran parseI64, which returned just the leading year -> garbage.
+    if (t == DbType.Timestamp) { return db.dbTimestamp(raw); }
     if (t == DbType.Float4 || t == DbType.Float8) { return db.dbDouble(string.parseFloat(raw)); }
     if (t == DbType.Decimal) { return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(raw), raw); } // S4: exact .dec
     return db.dbText(raw);
@@ -466,7 +469,7 @@ fn decodeBinaryCell(c: MyCursor, tf: int): DbValue {
         return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(s), s);
     }
     if (t == 10 || t == 7 || t == 12) {             // DATE / TIMESTAMP / DATETIME (binary)
-        return db.dbText(decodeBinaryDateTime(c));
+        return db.dbTimestamp(decodeBinaryDateTime(c));
     }
     // STRING / VAR_STRING / VARCHAR / BLOB / JSON / etc. -> lenenc string
     return db.dbText(c.lenencStr());
@@ -482,12 +485,23 @@ fn decodeBinaryDateTime(c: MyCursor): string {
     let day = c.byte();
     let hour = 0; let min = 0; let sec = 0;
     if (len >= 7) { hour = c.byte(); min = c.byte(); sec = c.byte(); }
-    if (len >= 11) { c.skip(4); }   // microseconds (dropped)
+    let micro = 0;
+    if (len >= 11) {
+        let m0 = c.byte(); let m1 = c.byte(); let m2 = c.byte(); let m3 = c.byte();
+        micro = m0 + m1 * 256 + m2 * 65536 + m3 * 16777216;
+    }
     let d = `${year}-${pad2(month)}-${pad2(day)}`;
-    if (len >= 7) { return `${d} ${pad2(hour)}:${pad2(min)}:${pad2(sec)}`; }
-    return d;
+    if (len < 7) { return d; }
+    let t = `${d} ${pad2(hour)}:${pad2(min)}:${pad2(sec)}`;
+    if (micro > 0) { return `${t}.${pad6(micro)}`; }   // was dropped -> silent precision loss
+    return t;
 }
 fn pad2(v: int): string { if (v < 10) { return `0${v}`; } return `${v}`; }
+fn pad6(v: int): string {
+    let s = `${v}`;
+    while (s.length < 6) { s = `0${s}`; }
+    return s;
+}
 
 // A binary-protocol result row: 0x00 header, NULL bitmap ((ncols+9)/8 bytes, offset by 2 bits),
 // then a binary value for each non-null column.
