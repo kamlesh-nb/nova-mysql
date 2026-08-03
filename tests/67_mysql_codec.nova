@@ -10,6 +10,7 @@ import string;
 import list;
 import db;
 import mysql;
+import crypto.hash.sha;
 
 // little-endian + lenenc builders (mirror the server encoding)
 fn u16leb(v: int): string { let p = bytes.alloc(2); bytes.write_byte(p,0,v%256); bytes.write_byte(p,1,(v/256)%256); return p as string; }
@@ -148,4 +149,73 @@ fn test_multidigit_param_and_blob(): void {
     let pb = List<DbValue>();
     pb.push(db.dbBlob("Hi"));
     assert.equalStr(mysql.substituteParams("$1", pb), "x'4869'");
+}
+
+@test
+fn test_multipacket_reassembly(): void {
+    // T14 Feature 1: a payload >= 0xFFFFFF is split — a packet whose length == 0xFFFFFF is a
+    // continuation marker; the logical payload continues until a packet with len < 0xFFFFFF.
+    // Build [0xFFFFFF-len packet][small packet] as ONE contiguous framed buffer and assert the
+    // reassembled payload length == 0xFFFFFF + small (bodies are zero-filled; only the join matters).
+    let big = 16777215;           // 0xFFFFFF
+    let small = 5;
+    let off2 = 4 + big;           // second packet header offset
+    let total = 4 + big + 4 + small;
+    let buf = bytes.alloc(total); // zero-filled bodies
+    // first header: u24 len = 0xFFFFFF (255,255,255), seq 0
+    bytes.write_byte(buf, 0, 255); bytes.write_byte(buf, 1, 255); bytes.write_byte(buf, 2, 255);
+    bytes.write_byte(buf, 3, 0);
+    // second header: u24 len = 5 (5,0,0), seq 1
+    bytes.write_byte(buf, off2, small); bytes.write_byte(buf, off2 + 1, 0); bytes.write_byte(buf, off2 + 2, 0);
+    bytes.write_byte(buf, off2 + 3, 1);
+    let joined = mysql.reassemblePayload(buf as string, 0);
+    assert.equalInt(joined.length, big + small);
+
+    // A single packet with len < 0xFFFFFF is returned as-is (no continuation).
+    let sp = b(3) + b(0) + b(0) + b(7) + "abc";   // len 3, seq 7, body "abc"
+    assert.equalStr(mysql.reassemblePayload(sp, 0), "abc");
+
+    // A continuation followed by a 0-length terminator packet stops the run at the empty packet.
+    let big2 = 16777215;
+    let t2 = 4 + big2 + 4;                          // [0xFFFFFF pkt][0-len pkt]
+    let tbuf = bytes.alloc(t2);
+    bytes.write_byte(tbuf, 0, 255); bytes.write_byte(tbuf, 1, 255); bytes.write_byte(tbuf, 2, 255);
+    // trailing header is len 0 (already zeroed) at offset 4+big2
+    let joined2 = mysql.reassemblePayload(tbuf as string, 0);
+    assert.equalInt(joined2.length, big2);
+}
+
+@test
+fn test_caching_sha2_scramble_roundtrip(): void {
+    // T14 Feature 2: caching_sha2_password fast-auth scramble.
+    //   token = SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) ++ nonce )
+    // Structural + round-trip self-check (no published vector needed): the token is 32 bytes, and
+    // token XOR SHA256(pw) must reproduce the inner hash SHA256(SHA256(SHA256(pw)) ++ nonce).
+    let sb = bytes.alloc(20);
+    let i = 0;
+    while (i < 20) { bytes.write_byte(sb, i, i + 1); i = i + 1; }
+    let nonce = sb as string;
+    let pw = "secret";
+
+    let token = mysql.cachingSha2Scramble(pw, nonce);
+    assert.equalInt(token.length, 32);
+
+    // Recompute the inner hash independently via the crypto/hash/sha256 primitive.
+    let inner = sha.sha256Raw(sha.sha256Raw(sha.sha256Raw(pw)) + nonce);
+    let s1 = sha.sha256Raw(pw);
+    let tp = token as ptr;
+    let ip = inner as ptr;
+    let sp2 = s1 as ptr;
+    let k = 0;
+    while (k < 32) {
+        // token[k] XOR SHA256(pw)[k] == inner[k]
+        assert.equalInt(bytes.read_byte(tp, k) ^ bytes.read_byte(sp2, k), bytes.read_byte(ip, k));
+        k = k + 1;
+    }
+
+    // Consistency: cachingSha2Scramble is the same wire scramble as mysqlSha2Scramble.
+    let alt = mysql.mysqlSha2Scramble(pw, nonce);
+    let ap = alt as ptr;
+    let m = 0;
+    while (m < 32) { assert.equalInt(bytes.read_byte(tp, m), bytes.read_byte(ap, m)); m = m + 1; }
 }

@@ -62,6 +62,14 @@ pub fn mysqlSha2Scramble(password: string, salt: string): string {
     return out as string;
 }
 
+// T14 Feature 2: caching_sha2_password fast-auth scramble, exposed under its protocol name.
+//   token = SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) ++ nonce )   (32 raw bytes)
+// This is exactly `mysqlSha2Scramble` (the wire driver's spelling); it is provided as a pure,
+// golden/round-trip-testable entry point. sha256_password uses the same fast-auth scramble.
+pub fn cachingSha2Scramble(password: string, nonce: string): string {
+    return mysqlSha2Scramble(password, nonce);
+}
+
 // D6: caching_sha2_password FULL auth (uncached password over a plaintext channel). The client
 // obfuscates the password by XOR-ing (password + a trailing NUL) with the 20-byte server nonce
 // cyclically, then RSA-OAEP-encrypts that under the server's RSA public key (PEM). Returns the
@@ -140,6 +148,30 @@ fn zeros(n: int): string {
 // A MySQL packet: [payload_len:u24 LE][seq:u8][payload].
 fn packet(seq: int, payload: string): string {
     return u24le(payload.length) + u8b(seq) + payload;
+}
+
+// T14 Feature 1: multi-packet (>=16MB) reassembly.
+// MySQL splits a payload of length >= 0xFFFFFF across packets: a packet whose length == 0xFFFFFF is a
+// CONTINUATION marker whose successor continues the SAME logical payload; the run ends at the first
+// packet with length < 0xFFFFFF (which may be 0). This PURE helper joins a CONTIGUOUS buffer of framed
+// packets ([u24 len LE][seq][body]...) starting at `off` into the full logical payload. readPacket
+// applies the identical continuation rule over the streaming socket reader (see below); this helper
+// is the offline-gated single source of truth for the join rule.
+pub const MYSQL_MAX_PACKET: int = 16777215;   // 0xFFFFFF
+pub fn reassemblePayload(buf: string, off: int): string {
+    let out = "";
+    let p = off;
+    while (true) {
+        let a = bytes.read_byte(buf as ptr, p);
+        let b = bytes.read_byte(buf as ptr, p + 1);
+        let c = bytes.read_byte(buf as ptr, p + 2);
+        let plen = a + b * 256 + c * 65536;
+        p = p + 4;                       // skip the 3-byte length + 1-byte sequence id
+        out = out + string.slice(buf, p, p + plen);
+        p = p + plen;
+        if (plen < MYSQL_MAX_PACKET) { return out; }
+    }
+    return out;
 }
 
 /// COM_QUERY (0x03) + SQL. Sequence id resets to 0 for a new command.
@@ -617,6 +649,25 @@ async fn readPacket(r: MyReader): Packet {
     // an inline `out as string` as a constructor arg is NOT tracked as owned, so the
     // packet payload leaked (same ARC-edge as the BtReader fix).
     let payload = out as string;
+    // T14 Feature 1: multi-packet reassembly. plen == 0xFFFFFF marks a continuation: the logical
+    // payload continues in the following packets until one with len < 0xFFFFFF ends the run (which may
+    // be a 0-length terminator). Concatenate every continuation body so ALL callers (query/exec/
+    // handshake) transparently receive the full logical payload. This mirrors the pure
+    // `reassemblePayload` join rule (which the offline gate verifies). NOTE: a single logical chunk is
+    // still bounded by the 64KB reader ring (a pre-existing limit, orthogonal to this feature).
+    while (plen == MYSQL_MAX_PACKET) {
+        if (!(await need(r, 4))) { return Packet("", false); }
+        let a2 = rbyte(r); let b2 = rbyte(r); let c2 = rbyte(r);
+        plen = a2 + b2 * 256 + c2 * 65536;
+        seq = rbyte(r);
+        if (plen > 0) { if (!(await need(r, plen))) { return Packet("", false); } }
+        let cont = bytes.alloc(plen);
+        let j = 0;
+        while (j < plen) { bytes.write_byte(cont, j, bytes.read_byte(r.buf, r.pos + j)); j = j + 1; }
+        r.pos = r.pos + plen;
+        let contStr = cont as string;
+        payload = payload + contStr;
+    }
     let pk = Packet(payload, true);
     pk.seq = seq;
     return pk;
