@@ -15,7 +15,7 @@
 // The wire CODEC (framing, lenenc, packet decode) is pure over byte buffers and gated
 // offline; the auth scramble is golden-verified. NOTE: not yet live-verified end-to-end (no
 // MySQL server was available) — the connect/query flow follows the spec but is unproven live.
-import net.asyncio;
+import net.aio;
 import bytes;
 import string;
 import list;
@@ -518,12 +518,12 @@ fn okAffectedRows(payload: string): int {
 
 // --- Buffered packet reader over a live TCP stream ----------------------------
 struct MyReader {
-    pub io: asyncio.AsyncStream,   // A1 async-first: fill awaits io.recvInto (parks, no thread held)
+    pub io: aio.AsyncStream,   // A1 async-first: fill awaits io.recvInto (parks, no thread held)
     pub buf: ptr,
     pub cap: int,
     pub len: int,
     pub pos: int,
-    init(io: asyncio.AsyncStream) {
+    init(io: aio.AsyncStream) {
         self.io = io;
         self.cap = 65536;
         self.buf = bytes.alloc(65536);
@@ -589,7 +589,7 @@ async fn readPacket(r: MyReader): Packet {
     return pk;
 }
 
-async fn sendPacket(io: asyncio.AsyncStream, frame: string): int {
+async fn sendPacket(io: aio.AsyncStream, frame: string): int {
     return await io.sendStr(frame);
 }
 
@@ -601,10 +601,10 @@ fn isOk(p: string): bool { return p.length > 0 && p[0] == 0; }
 // --- The seam implementation --------------------------------------------------
 
 pub struct MyConnection impl Connection {
-    pub io: asyncio.AsyncStream,
+    pub io: aio.AsyncStream,
     pub reader: MyReader,
     pub stmts: List<MyStmt>,   // D6: server-side prepared-statement cache (COM_STMT_*)
-    init(io: asyncio.AsyncStream, reader: MyReader) {
+    init(io: aio.AsyncStream, reader: MyReader) {
         self.io = io;
         self.reader = reader;
         self.stmts = List<MyStmt>();
@@ -808,7 +808,7 @@ pub fn substituteParams(sql: string, params: List<DbValue>): string {
 // Whole connect + auth handshake as ONE async fn, driven once by the sync Driver.connect.
 async fn myConnectAsync(dsn: string): MyConnection {
         let d = parseDsn(dsn);
-        let stream = await asyncio.asyncConnect(d.host, d.port);
+        let stream = await aio.asyncConnect(d.host, d.port);
         let reader = MyReader(stream);
 
         let hp = await readPacket(reader);
