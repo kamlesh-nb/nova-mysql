@@ -275,13 +275,14 @@ struct MyCursor {
 struct Handshake {
     pub salt: string,
     pub plugin: string,
-    init(salt: string, plugin: string) { self.salt = salt; self.plugin = plugin; }
+    pub connId: int,      // T8: 4-byte thread/connection id (needed for KILL QUERY cancellation)
+    init(salt: string, plugin: string, connId: int) { self.salt = salt; self.plugin = plugin; self.connId = connId; }
 }
 pub fn parseHandshake(payload: string): Handshake {
     let c = MyCursor(payload);
     c.skip(1);            // protocol version (10)
     let sv = c.cstr();    // server version
-    c.skip(4);            // connection id
+    let connId = c.u32(); // connection (thread) id — T8 captures it for KILL QUERY
     let salt1 = c.take(8);
     c.skip(1);            // filler 0
     c.skip(2);            // capability flags lower
@@ -296,7 +297,7 @@ pub fn parseHandshake(payload: string): Handshake {
     let salt2 = c.take(part2len);
     let plugin = "mysql_native_password";
     if (c.remaining() > 0) { plugin = c.cstr(); }
-    return Handshake(salt1 + salt2, plugin);
+    return Handshake(salt1 + salt2, plugin, connId);
 }
 
 // --- Result decoders ----------------------------------------------------------
@@ -581,6 +582,32 @@ fn okAffectedRows(payload: string): int {
     return c.lenenc();
 }
 
+// T14 Feature 1 (multi-resultset): the OK/EOF terminating packet carries a 16-bit status-flags
+// field; SERVER_MORE_RESULTS_EXISTS (0x0008) means another result set follows (a multi-statement
+// query or a stored procedure's several selects).
+pub fn moreResultsExists(statusFlags: int): bool { return (statusFlags & 0x0008) != 0; }
+
+// OK packet (CLIENT_PROTOCOL_41): 0x00, affected_rows(lenenc), last_insert_id(lenenc),
+// status_flags(u16), warnings(u16). Extract the status flags.
+pub fn okStatusFlags(payload: string): int {
+    let c = MyCursor(payload);
+    c.skip(1);            // 0x00
+    c.lenenc();           // affected_rows
+    c.lenenc();           // last_insert_id
+    if (c.remaining() < 2) { return 0; }
+    return c.u16();
+}
+
+// EOF packet (this build does NOT set CLIENT_DEPRECATE_EOF, so EOFs are present): 0xfe,
+// warnings(u16), status_flags(u16). Extract the status flags.
+pub fn eofStatusFlags(payload: string): int {
+    if (payload.length < 5) { return 0; }
+    let c = MyCursor(payload);
+    c.skip(1);            // 0xfe
+    c.u16();              // warnings
+    return c.u16();
+}
+
 // --- Buffered packet reader over a live TCP stream ----------------------------
 struct MyReader {
     pub io: aio.AsyncIO,   // A1 async-first: fill awaits io.recvInto (parks, no thread held)
@@ -689,11 +716,27 @@ pub struct MyConnection impl Connection {
     pub reader: MyReader,
     pub stmts: List<MyStmt>,   // D6: server-side prepared-statement cache (COM_STMT_*)
     pub busy: bool,   // concurrency guard: one in-flight request per connection
+    pub connId: int,  // T8: server's thread id (from the handshake) — the KILL QUERY target
+    pub dsn: string,  // T8: the DSN so cancel() can open a SEPARATE side connection
     init(io: aio.AsyncIO, reader: MyReader) {
         self.io = io;
         self.reader = reader;
         self.stmts = List<MyStmt>();
         self.busy = false;
+        self.connId = 0;
+        self.dsn = "";
+    }
+
+    // T8 query cancellation. MySQL cancels an in-flight query by opening a SEPARATE connection and
+    // running `KILL QUERY <connection_id>` (the running connection is blocked on the server, so the
+    // kill must arrive on another socket). `cancelSql` is the pure statement; `cancel` opens the side
+    // connection to the same host/DSN and executes it. Live step: needs a reachable MySQL server.
+    pub fn cancelSql(self): string { return buildKillQuery(self.connId); }
+    pub async fn cancel(self): ExecResult {
+        let side = await myConnectAsync(self.dsn);
+        let r = await side.exec(self.cancelSql(), List<DbValue>());
+        side.close();
+        return r;
     }
 
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
@@ -701,33 +744,52 @@ pub struct MyConnection impl Connection {
         self.busy = true;
         await sendPacket(self.io, buildComQuery(substituteParams(sql, params)));
         let rs = ResultSet();
-        let first = await readPacket(self.reader);
-        if (!first.ok) { rs.err = DbError("", "connection read failed"); self.busy = false; return rs; }
-        if (isErr(first.payload)) { rs.err = decodeErr(first.payload); self.busy = false; return rs; }
-        if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); self.busy = false; return rs; }
-
-        // first.payload = column_count (lenenc).
-        let cc = MyCursor(first.payload);
-        let ncols = cc.lenenc();
-        let i = 0;
-        while (i < ncols) {
-            let cp = await readPacket(self.reader);
-            if (!cp.ok) { self.busy = false; return rs; }
-            rs.columns.push(decodeColumnDef(cp.payload));
-            i = i + 1;
+        // T14 Feature 1: multi-resultset. A multi-statement query or stored procedure yields several
+        // result sets back-to-back; each terminating OK/EOF sets SERVER_MORE_RESULTS_EXISTS (0x0008)
+        // when another follows. Loop until a terminating packet clears that bit, consuming ALL result
+        // sets so the connection is never left mid-stream; `rs` holds the LAST result set.
+        let more = true;
+        while (more) {
+            more = false;
+            let first = await readPacket(self.reader);
+            if (!first.ok) { rs.err = DbError("", "connection read failed"); self.busy = false; return rs; }
+            if (isErr(first.payload)) { rs.err = decodeErr(first.payload); self.busy = false; return rs; }
+            if (isOk(first.payload)) {
+                // A resultset-less statement (INSERT/UPDATE/DDL inside a multi-statement run).
+                let ok = ResultSet();
+                ok.rows_affected = okAffectedRows(first.payload);
+                rs = ok;
+                more = moreResultsExists(okStatusFlags(first.payload));
+            } else {
+                // first.payload = column_count (lenenc).
+                let cur = ResultSet();
+                let cc = MyCursor(first.payload);
+                let ncols = cc.lenenc();
+                let i = 0;
+                while (i < ncols) {
+                    let cp = await readPacket(self.reader);
+                    if (!cp.ok) { rs = cur; self.busy = false; return rs; }
+                    cur.columns.push(decodeColumnDef(cp.payload));
+                    i = i + 1;
+                }
+                // EOF after column defs.
+                let eof1 = await readPacket(self.reader);
+                // Rows until EOF (an ERR here is a mid-result failure -- surface it). The terminating
+                // EOF's status flags decide whether a further result set follows.
+                let termFlags = 0;
+                while (true) {
+                    let rp = await readPacket(self.reader);
+                    if (!rp.ok) { break; }
+                    if (isErr(rp.payload)) { cur.err = decodeErr(rp.payload); break; }
+                    if (isEof(rp.payload)) { termFlags = eofStatusFlags(rp.payload); break; }
+                    cur.rows.push(decodeTextRow(rp.payload, cur.columns));
+                }
+                cur.rows_affected = cur.rows.size();
+                cur.tag = `SELECT ${cur.rows.size()}`;
+                rs = cur;
+                more = moreResultsExists(termFlags);
+            }
         }
-        // EOF after column defs.
-        let eof1 = await readPacket(self.reader);
-        // Rows until EOF (an ERR here is a mid-result failure -- surface it).
-        while (true) {
-            let rp = await readPacket(self.reader);
-            if (!rp.ok) { break; }
-            if (isErr(rp.payload)) { rs.err = decodeErr(rp.payload); break; }
-            if (isEof(rp.payload)) { break; }
-            rs.rows.push(decodeTextRow(rp.payload, rs.columns));
-        }
-        rs.rows_affected = rs.rows.size();
-        rs.tag = `SELECT ${rs.rows.size()}`;
         self.busy = false;
         return rs;
     }
@@ -904,6 +966,9 @@ fn valueToSql(v: DbValue): string {
     let iv = v.asLong();
     return `${iv}`;
 }
+// T8: the KILL QUERY statement for a connection id, using the driver's `${}` int->string rendering.
+pub fn buildKillQuery(connId: int): string { return `KILL QUERY ${connId}`; }
+
 pub fn substituteParams(sql: string, params: List<DbValue>): string {
     let out = "";
     let i = 0;
@@ -956,7 +1021,7 @@ async fn myConnectAsync(dsn: string): MyConnection {
         // concrete stream into myAuthFinish's AsyncIO param is a widening (the safe direction).
         if (string.eql(d.sslmode, "disable")) {
             await sendPacket(stream, buildHandshakeResponse(d.user, d.database, scramble, hs.plugin));
-            return await myAuthFinish(stream, reader, d, hs.salt);
+            return await myAuthFinish(stream, reader, d, hs.salt, hs.connId, dsn);
         }
         let sslCaps = clientCapabilities() + CLIENT_SSL;
         await sendPacket(stream, buildSSLRequest(sslCaps, hp.seq + 1));
@@ -965,18 +1030,18 @@ async fn myConnectAsync(dsn: string): MyConnection {
             let ts = await asynctls.tlsClientUpgradeVerify(stream, d.host, caPem);
             reader.io = ts;
             await sendPacket(ts, buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
-            return await myAuthFinish(ts, reader, d, hs.salt);
+            return await myAuthFinish(ts, reader, d, hs.salt, hs.connId, dsn);
         }
         let ts2 = await asynctls.tlsClientUpgrade(stream, d.host);
         reader.io = ts2;
         await sendPacket(ts2, buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
-        return await myAuthFinish(ts2, reader, d, hs.salt);
+        return await myAuthFinish(ts2, reader, d, hs.salt, hs.connId, dsn);
 }
 
 // The post-response auth flow (auth-result, AuthSwitch, caching_sha2 full-auth) over `io` (plaintext
 // AsyncStream or an upgraded TlsStream, both AsyncIO). `reader` reads the responses; its transport was
 // pointed at `io` by the caller before the TLS path invoked this.
-async fn myAuthFinish(io: aio.AsyncIO, reader: MyReader, d: MyDsn, initSalt: string): MyConnection {
+async fn myAuthFinish(io: aio.AsyncIO, reader: MyReader, d: MyDsn, initSalt: string, connId: int, dsn: string): MyConnection {
         // `activeSalt` is the nonce the current auth response was computed against — the RSA full-auth
         // path XORs the password with it, so it must track any AuthSwitch.
         let activeSalt = initSalt;
@@ -1019,7 +1084,10 @@ async fn myAuthFinish(io: aio.AsyncIO, reader: MyReader, d: MyDsn, initSalt: str
                 let after = await readPacket(reader);                // 0x03 fast success -> real OK
             }
         }
-        return MyConnection(io, reader);
+        let conn = MyConnection(io, reader);
+        conn.connId = connId;   // T8: KILL QUERY target captured from the handshake
+        conn.dsn = dsn;         // T8: enables cancel() to open a side connection
+        return conn;
 }
 
 pub struct MyDriver impl Driver {
