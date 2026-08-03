@@ -637,19 +637,23 @@ pub struct MyConnection impl Connection {
     pub io: aio.AsyncIO,
     pub reader: MyReader,
     pub stmts: List<MyStmt>,   // D6: server-side prepared-statement cache (COM_STMT_*)
+    pub busy: bool,   // concurrency guard: one in-flight request per connection
     init(io: aio.AsyncIO, reader: MyReader) {
         self.io = io;
         self.reader = reader;
         self.stmts = List<MyStmt>();
+        self.busy = false;
     }
 
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         await sendPacket(self.io, buildComQuery(substituteParams(sql, params)));
         let rs = ResultSet();
         let first = await readPacket(self.reader);
-        if (!first.ok) { rs.err = DbError("", "connection read failed"); return rs; }
-        if (isErr(first.payload)) { rs.err = decodeErr(first.payload); return rs; }
-        if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); return rs; }
+        if (!first.ok) { rs.err = DbError("", "connection read failed"); self.busy = false; return rs; }
+        if (isErr(first.payload)) { rs.err = decodeErr(first.payload); self.busy = false; return rs; }
+        if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); self.busy = false; return rs; }
 
         // first.payload = column_count (lenenc).
         let cc = MyCursor(first.payload);
@@ -657,7 +661,7 @@ pub struct MyConnection impl Connection {
         let i = 0;
         while (i < ncols) {
             let cp = await readPacket(self.reader);
-            if (!cp.ok) { return rs; }
+            if (!cp.ok) { self.busy = false; return rs; }
             rs.columns.push(decodeColumnDef(cp.payload));
             i = i + 1;
         }
@@ -673,16 +677,20 @@ pub struct MyConnection impl Connection {
         }
         rs.rows_affected = rs.rows.size();
         rs.tag = `SELECT ${rs.rows.size()}`;
+        self.busy = false;
         return rs;
     }
 
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         await sendPacket(self.io, buildComQuery(substituteParams(sql, params)));
         let p = await readPacket(self.reader);
-        if (!p.ok) { return errorExec(DbError("", "connection read failed")); }
-        if (isErr(p.payload)) { return errorExec(decodeErr(p.payload)); }
-        if (isOk(p.payload)) { return ExecResult(okAffectedRows(p.payload), "OK"); }
+        if (!p.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
+        if (isErr(p.payload)) { self.busy = false; return errorExec(decodeErr(p.payload)); }
+        if (isOk(p.payload)) { self.busy = false; return ExecResult(okAffectedRows(p.payload), "OK"); }
         // A result set slipped through (SELECT via exec); drain to ReadyForQuery-equivalent.
+        self.busy = false;
         return ExecResult(0, "OK");
     }
 
@@ -741,14 +749,16 @@ pub struct MyConnection impl Connection {
     }
 
     pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let rs = ResultSet();
-        if (stmt < 0 || stmt >= self.stmts.size()) { return rs; }
+        if (stmt < 0 || stmt >= self.stmts.size()) { self.busy = false; return rs; }
         let s = self.stmts.get(stmt) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
         await sendPacket(self.io, buildStmtExecute(s.id, params));
         let first = await readPacket(self.reader);
-        if (!first.ok) { rs.err = DbError("", "connection read failed"); return rs; }
-        if (isErr(first.payload)) { rs.err = decodeErr(first.payload); return rs; }
-        if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); return rs; }
+        if (!first.ok) { rs.err = DbError("", "connection read failed"); self.busy = false; return rs; }
+        if (isErr(first.payload)) { rs.err = decodeErr(first.payload); self.busy = false; return rs; }
+        if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); self.busy = false; return rs; }
         // column_count(lenenc), then column defs + EOF, then BINARY rows until EOF.
         let cc = MyCursor(first.payload);
         let ncols = cc.lenenc();
@@ -772,17 +782,20 @@ pub struct MyConnection impl Connection {
         }
         rs.rows_affected = rs.rows.size();
         rs.tag = `SELECT ${rs.rows.size()}`;
+        self.busy = false;
         return rs;
     }
 
     pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
-        if (stmt < 0 || stmt >= self.stmts.size()) { return ExecResult(0, ""); }
+        if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        if (stmt < 0 || stmt >= self.stmts.size()) { self.busy = false; return ExecResult(0, ""); }
         let s = self.stmts.get(stmt) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
         await sendPacket(self.io, buildStmtExecute(s.id, params));
         let p = await readPacket(self.reader);
-        if (!p.ok) { return errorExec(DbError("", "connection read failed")); }
-        if (isErr(p.payload)) { return errorExec(decodeErr(p.payload)); }
-        if (isOk(p.payload)) { return ExecResult(okAffectedRows(p.payload), "OK"); }
+        if (!p.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
+        if (isErr(p.payload)) { self.busy = false; return errorExec(decodeErr(p.payload)); }
+        if (isOk(p.payload)) { self.busy = false; return ExecResult(okAffectedRows(p.payload), "OK"); }
         // A result set (SELECT via execPrepared): drain column defs + rows to keep the stream aligned.
         let cc = MyCursor(p.payload);
         let ncols = cc.lenenc();
@@ -796,7 +809,8 @@ pub struct MyConnection impl Connection {
             if (isErr(rp.payload)) { derr = decodeErr(rp.payload); break; }
             if (isEof(rp.payload)) { break; }
         }
-        if (!derr.isEmpty()) { return errorExec(derr); }
+        if (!derr.isEmpty()) { self.busy = false; return errorExec(derr); }
+        self.busy = false;
         return ExecResult(0, "OK");
     }
 }
