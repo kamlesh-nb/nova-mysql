@@ -137,3 +137,15 @@ fn test_text_datetime_decode(): void {
     let row = mysql.decodeTextRow(rp, cols);
     assert.equalStr(row.getTimestamp(0), "2024-01-01 10:00:00");
 }
+
+@test
+fn test_multidigit_param_and_blob(): void {
+    // T4: multi-digit $N + binary-safe x'HEX' blob literal.
+    let p = List<DbValue>();
+    let i = 0;
+    while (i < 12) { p.push(db.dbInt(i + 1)); i = i + 1; }
+    assert.equalStr(mysql.substituteParams("VALUES ($1, $10, $12)", p), "VALUES (1, 10, 12)");
+    let pb = List<DbValue>();
+    pb.push(db.dbBlob("Hi"));
+    assert.equalStr(mysql.substituteParams("$1", pb), "x'4869'");
+}
