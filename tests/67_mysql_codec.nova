@@ -115,3 +115,15 @@ fn test_native_password_scramble_golden(): void {
     assert.equalInt(bytes.read_byte(gp, 2), 179);
     assert.equalInt(bytes.read_byte(gp, 19), 47);
 }
+
+@test
+fn test_ssl_request_frame(): void {
+    // T2: SSLRequest = [u24 len=32 LE][seq][32-byte trunc HandshakeResponse41 with CLIENT_SSL].
+    let f = mysql.buildSSLRequest(2048 + 8, 1);   // caps with CLIENT_SSL(0x800) set
+    assert.equalInt(f.length, 36);   // 3 (len) + 1 (seq) + 32 (body)
+    assert.equalInt(f[0], 32);       // payload length low byte
+    assert.equalInt(f[1], 0); assert.equalInt(f[2], 0);
+    assert.equalInt(f[3], 1);        // sequence id
+    // caps u32le starts at byte 4; CLIENT_SSL (0x800) is bit 3 of byte 5.
+    assert.equalInt(f[5] & 8, 8);
+}

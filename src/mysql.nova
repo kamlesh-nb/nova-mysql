@@ -16,6 +16,8 @@
 // offline; the auth scramble is golden-verified. NOTE: not yet live-verified end-to-end (no
 // MySQL server was available) — the connect/query flow follows the spec but is unproven live.
 import net.aio;
+import net.asynctls;
+import io.file;
 import bytes;
 import string;
 import list;
@@ -147,8 +149,18 @@ pub fn buildComQuery(sql: string): string {
 
 /// HandshakeResponse41: capabilities, max-packet, charset, 23 filler, user, auth response
 /// (lenenc byte + scramble), database, auth-plugin-name. Sequence id 1 (server handshake = 0).
+// CLIENT_SSL capability flag. Set (alongside the base flags) when the client will run the TLS
+// handshake between the server Handshake and the HandshakeResponse (STARTTLS).
+const CLIENT_SSL: int = 2048;
+
 pub fn buildHandshakeResponse(user: string, database: string, scramble: string, plugin: string): string {
-    let body = u32le(clientCapabilities())
+    return buildHandshakeResponseFull(user, database, scramble, plugin, clientCapabilities(), 1);
+}
+
+// Caps/seq-parameterized HandshakeResponse41. The TLS path sends this with caps | CLIENT_SSL at seq 2
+// (the SSLRequest took seq 1); the plaintext path uses the base caps at seq 1.
+pub fn buildHandshakeResponseFull(user: string, database: string, scramble: string, plugin: string, caps: int, seq: int): string {
+    let body = u32le(caps)
         + u32le(16777216)         // max packet 16MB
         + u8b(45)                 // charset utf8mb4_general_ci
         + zeros(23)
@@ -156,7 +168,14 @@ pub fn buildHandshakeResponse(user: string, database: string, scramble: string, 
         + lenencStr(scramble)     // SECURE_CONNECTION: 1-byte length + scramble
         + cstr(database)
         + cstr(plugin);
-    return packet(1, body);
+    return packet(seq, body);
+}
+
+// SSLRequest: the first 32 bytes of a HandshakeResponse41 (caps incl CLIENT_SSL, max-packet, charset,
+// 23 filler) and nothing else. Sent at seq 1; the TLS handshake then runs on the socket.
+pub fn buildSSLRequest(caps: int, seq: int): string {
+    let body = u32le(caps) + u32le(16777216) + u8b(45) + zeros(23);
+    return packet(seq, body);
 }
 
 // --- Payload cursor (decode, pure over a byte-buffer string) ------------------
@@ -518,12 +537,12 @@ fn okAffectedRows(payload: string): int {
 
 // --- Buffered packet reader over a live TCP stream ----------------------------
 struct MyReader {
-    pub io: aio.AsyncStream,   // A1 async-first: fill awaits io.recvInto (parks, no thread held)
+    pub io: aio.AsyncIO,   // A1 async-first: fill awaits io.recvInto (parks, no thread held)
     pub buf: ptr,
     pub cap: int,
     pub len: int,
     pub pos: int,
-    init(io: aio.AsyncStream) {
+    init(io: aio.AsyncIO) {
         self.io = io;
         self.cap = 65536;
         self.buf = bytes.alloc(65536);
@@ -589,7 +608,7 @@ async fn readPacket(r: MyReader): Packet {
     return pk;
 }
 
-async fn sendPacket(io: aio.AsyncStream, frame: string): int {
+async fn sendPacket(io: aio.AsyncIO, frame: string): int {
     return await io.sendStr(frame);
 }
 
@@ -601,10 +620,10 @@ fn isOk(p: string): bool { return p.length > 0 && p[0] == 0; }
 // --- The seam implementation --------------------------------------------------
 
 pub struct MyConnection impl Connection {
-    pub io: aio.AsyncStream,
+    pub io: aio.AsyncIO,
     pub reader: MyReader,
     pub stmts: List<MyStmt>,   // D6: server-side prepared-statement cache (COM_STMT_*)
-    init(io: aio.AsyncStream, reader: MyReader) {
+    init(io: aio.AsyncIO, reader: MyReader) {
         self.io = io;
         self.reader = reader;
         self.stmts = List<MyStmt>();
@@ -832,20 +851,41 @@ async fn myConnectAsync(dsn: string): MyConnection {
                 scramble = mysqlNativeScramble(d.password, hs.salt);
             }
         }
-        await sendPacket(stream, buildHandshakeResponse(d.user, d.database, scramble, hs.plugin));
 
-        // `activeSalt` is the nonce the current auth response was computed against — it is also
-        // what the RSA full-auth path XORs the password with, so it must track any AuthSwitch.
-        let activeSalt = hs.salt;
+        // STARTTLS: when sslmode is set, run TLS between the server Handshake and the
+        // HandshakeResponse. SSLRequest = the first 32 bytes of the response with CLIENT_SSL set (seq 1);
+        // then the socket is upgraded and the full response is sent over TLS (seq 2). Passing the
+        // concrete stream into myAuthFinish's AsyncIO param is a widening (the safe direction).
+        if (string.eql(d.sslmode, "disable")) {
+            await sendPacket(stream, buildHandshakeResponse(d.user, d.database, scramble, hs.plugin));
+            return await myAuthFinish(stream, reader, d, hs.salt);
+        }
+        let sslCaps = clientCapabilities() + CLIENT_SSL;
+        await sendPacket(stream, buildSSLRequest(sslCaps, hp.seq + 1));
+        if (string.eql(d.sslmode, "verify-full")) {
+            let caPem = if (d.sslrootcert != "") File.readText(d.sslrootcert) else "";
+            let ts = await asynctls.tlsClientUpgradeVerify(stream, d.host, caPem);
+            reader.io = ts;
+            await sendPacket(ts, buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
+            return await myAuthFinish(ts, reader, d, hs.salt);
+        }
+        let ts2 = await asynctls.tlsClientUpgrade(stream, d.host);
+        reader.io = ts2;
+        await sendPacket(ts2, buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
+        return await myAuthFinish(ts2, reader, d, hs.salt);
+}
 
-        // Read the auth result. For caching_sha2_password the server may reply with
-        // AuthMoreData (0x01): 0x03 = fast-auth success (followed by the real OK),
-        // 0x04 = full auth required (RSA-encrypted password, handled below).
+// The post-response auth flow (auth-result, AuthSwitch, caching_sha2 full-auth) over `io` (plaintext
+// AsyncStream or an upgraded TlsStream, both AsyncIO). `reader` reads the responses; its transport was
+// pointed at `io` by the caller before the TLS path invoked this.
+async fn myAuthFinish(io: aio.AsyncIO, reader: MyReader, d: MyDsn, initSalt: string): MyConnection {
+        // `activeSalt` is the nonce the current auth response was computed against — the RSA full-auth
+        // path XORs the password with it, so it must track any AuthSwitch.
+        let activeSalt = initSalt;
         let ar = await readPacket(reader);
 
-        // AuthSwitchRequest (0xfe): the server names the plugin it wants + a fresh
-        // 20-byte salt; re-scramble against THAT and reply (seq+1). MySQL 8/9 sends
-        // this for caching_sha2_password.
+        // AuthSwitchRequest (0xfe): the server names the plugin it wants + a fresh 20-byte salt;
+        // re-scramble against THAT and reply (seq+1). MySQL 8/9 sends this for caching_sha2_password.
         if (ar.payload.length > 0 && bytes.read_byte(ar.payload, 0) == 254) {
             let sc = MyCursor(ar.payload);
             sc.skip(1);
@@ -860,29 +900,28 @@ async fn myConnectAsync(dsn: string): MyConnection {
                     sw = mysqlNativeScramble(d.password, swSalt);
                 }
             }
-            await sendPacket(stream, packet(ar.seq + 1, sw));
+            await sendPacket(io, packet(ar.seq + 1, sw));
             ar = await readPacket(reader);
         }
 
         // caching_sha2 AuthMoreData (0x01): byte[1] selects the sub-path.
         //   0x03 = fast-auth success -> the real OK follows.
-        //   0x04 = full auth required (password not in the server's cache). Over a plaintext
-        //          channel: request the server's RSA public key (0x02), then send the password
-        //          XOR-nonce, RSA-OAEP-encrypted under that key.
+        //   0x04 = full auth required. Over TLS the password could go in cleartext, but sending the
+        //          RSA-encrypted password works on both transports, so keep the one path.
         if (ar.payload.length > 1 && bytes.read_byte(ar.payload, 0) == 1) {
             let more = bytes.read_byte(ar.payload, 1);
             if (more == 4) {
-                await sendPacket(stream, packet(ar.seq + 1, u8b(2)));   // 0x02: request RSA public key
-                let pk = await readPacket(reader);                       // AuthMoreData(0x01) + PEM
+                await sendPacket(io, packet(ar.seq + 1, u8b(2)));   // 0x02: request RSA public key
+                let pk = await readPacket(reader);                   // AuthMoreData(0x01) + PEM
                 let pem = string.slice(pk.payload, 1, pk.payload.length);
                 let enc = rsaEncryptPassword(d.password, activeSalt, pem);
-                await sendPacket(stream, packet(pk.seq + 1, enc));
-                let ok = await readPacket(reader);                       // OK (or ERR)
+                await sendPacket(io, packet(pk.seq + 1, enc));
+                let ok = await readPacket(reader);                   // OK (or ERR)
             } else {
-                let after = await readPacket(reader);                    // 0x03 fast success -> real OK
+                let after = await readPacket(reader);                // 0x03 fast success -> real OK
             }
         }
-        return MyConnection(stream, reader);
+        return MyConnection(io, reader);
 }
 
 pub struct MyDriver impl Driver {
@@ -897,15 +936,33 @@ struct MyDsn {
     pub user: string,
     pub password: string,
     pub database: string,
-    init(host: string, port: int, user: string, password: string, database: string) {
+    pub sslmode: string,       // "disable" (default) | "require" | "verify-full"
+    pub sslrootcert: string,   // PEM CA bundle path (verify-full)
+    init(host: string, port: int, user: string, password: string, database: string, sslmode: string, sslrootcert: string) {
         self.host = host; self.port = port; self.user = user;
         self.password = password; self.database = database;
+        self.sslmode = sslmode; self.sslrootcert = sslrootcert;
     }
 }
+// Pull `key=value` out of a `?a=b&c=d` DSN query string (returns `dflt` if absent).
+fn dsnParam(dsn: string, key: string, dflt: string): string {
+    let needle = key + "=";
+    let idx = string.indexOf(dsn, needle);
+    if (idx == -1) { return dflt; }
+    let rest = string.slice(dsn, idx + needle.length, dsn.length);
+    let amp = string.indexOf(rest, "&");
+    if (amp == -1) { return rest; }
+    return string.slice(rest, 0, amp);
+}
 fn parseDsn(dsn: string): MyDsn {
+    let sslmode = dsnParam(dsn, "sslmode", "disable");
+    let sslrootcert = dsnParam(dsn, "sslrootcert", "");
+
     let s = dsn;
     let scheme = string.indexOf(s, "://");
     if (scheme != -1) { s = string.slice(s, scheme + 3, s.length); }
+    let qq = string.indexOf(s, "?");
+    if (qq != -1) { s = string.slice(s, 0, qq); }
 
     let user = "root";
     let password = "";
@@ -930,5 +987,5 @@ fn parseDsn(dsn: string): MyDsn {
         host = string.slice(s, 0, pc);
         port = string.parseI64(string.slice(s, pc + 1, s.length));
     }
-    return MyDsn(host, port, user, password, database);
+    return MyDsn(host, port, user, password, database, sslmode, sslrootcert);
 }
