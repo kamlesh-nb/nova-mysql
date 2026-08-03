@@ -692,6 +692,11 @@ pub struct MyConnection impl Connection {
         self.io.close();
     }
 
+    // Transaction control (BEGIN is a MySQL alias for START TRANSACTION).
+    pub async fn begin(self): ExecResult { return await self.exec("BEGIN", List<DbValue>()); }
+    pub async fn commit(self): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
+    pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
+
     pub fn setTimeout(self, ms: int): int {   // D6 — async per-recv awaited deadline
         return self.io.setTimeout(ms);
     }
