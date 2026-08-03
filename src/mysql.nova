@@ -614,8 +614,8 @@ pub struct MyConnection impl Connection {
         await sendPacket(self.io, buildComQuery(substituteParams(sql, params)));
         let rs = ResultSet();
         let first = await readPacket(self.reader);
-        if (!first.ok) { return rs; }
-        if (isErr(first.payload)) { rs.tag = "ERROR"; return rs; }
+        if (!first.ok) { rs.err = DbError("", "connection read failed"); return rs; }
+        if (isErr(first.payload)) { rs.err = decodeErr(first.payload); return rs; }
         if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); return rs; }
 
         // first.payload = column_count (lenenc).
@@ -630,11 +630,12 @@ pub struct MyConnection impl Connection {
         }
         // EOF after column defs.
         let eof1 = await readPacket(self.reader);
-        // Rows until EOF.
+        // Rows until EOF (an ERR here is a mid-result failure -- surface it).
         while (true) {
             let rp = await readPacket(self.reader);
             if (!rp.ok) { break; }
-            if (isEof(rp.payload) || isErr(rp.payload)) { break; }
+            if (isErr(rp.payload)) { rs.err = decodeErr(rp.payload); break; }
+            if (isEof(rp.payload)) { break; }
             rs.rows.push(decodeTextRow(rp.payload, rs.columns));
         }
         rs.rows_affected = rs.rows.size();
@@ -645,8 +646,8 @@ pub struct MyConnection impl Connection {
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
         await sendPacket(self.io, buildComQuery(substituteParams(sql, params)));
         let p = await readPacket(self.reader);
-        if (!p.ok) { return ExecResult(0, "ERROR"); }
-        if (isErr(p.payload)) { return ExecResult(0, "ERROR"); }
+        if (!p.ok) { return errorExec(DbError("", "connection read failed")); }
+        if (isErr(p.payload)) { return errorExec(decodeErr(p.payload)); }
         if (isOk(p.payload)) { return ExecResult(okAffectedRows(p.payload), "OK"); }
         // A result set slipped through (SELECT via exec); drain to ReadyForQuery-equivalent.
         return ExecResult(0, "OK");
@@ -707,8 +708,8 @@ pub struct MyConnection impl Connection {
         let s = self.stmts.get(stmt) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
         await sendPacket(self.io, buildStmtExecute(s.id, params));
         let first = await readPacket(self.reader);
-        if (!first.ok) { return rs; }
-        if (isErr(first.payload)) { rs.tag = "ERROR"; return rs; }
+        if (!first.ok) { rs.err = DbError("", "connection read failed"); return rs; }
+        if (isErr(first.payload)) { rs.err = decodeErr(first.payload); return rs; }
         if (isOk(first.payload)) { rs.rows_affected = okAffectedRows(first.payload); return rs; }
         // column_count(lenenc), then column defs + EOF, then BINARY rows until EOF.
         let cc = MyCursor(first.payload);
@@ -727,7 +728,8 @@ pub struct MyConnection impl Connection {
         while (true) {
             let rp = await readPacket(self.reader);
             if (!rp.ok) { break; }
-            if (isEof(rp.payload) || isErr(rp.payload)) { break; }
+            if (isErr(rp.payload)) { rs.err = decodeErr(rp.payload); break; }
+            if (isEof(rp.payload)) { break; }
             rs.rows.push(decodeBinaryRow(rp.payload, rs.columns, colTypes));
         }
         rs.rows_affected = rs.rows.size();
@@ -740,7 +742,8 @@ pub struct MyConnection impl Connection {
         let s = self.stmts.get(stmt) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
         await sendPacket(self.io, buildStmtExecute(s.id, params));
         let p = await readPacket(self.reader);
-        if (!p.ok || isErr(p.payload)) { return ExecResult(0, "ERROR"); }
+        if (!p.ok) { return errorExec(DbError("", "connection read failed")); }
+        if (isErr(p.payload)) { return errorExec(decodeErr(p.payload)); }
         if (isOk(p.payload)) { return ExecResult(okAffectedRows(p.payload), "OK"); }
         // A result set (SELECT via execPrepared): drain column defs + rows to keep the stream aligned.
         let cc = MyCursor(p.payload);
@@ -748,11 +751,14 @@ pub struct MyConnection impl Connection {
         let i = 0;
         while (i < ncols) { let cp = await readPacket(self.reader); i = i + 1; }
         let eof1 = await readPacket(self.reader);
+        let derr = noError();
         while (true) {
             let rp = await readPacket(self.reader);
             if (!rp.ok) { break; }
-            if (isEof(rp.payload) || isErr(rp.payload)) { break; }
+            if (isErr(rp.payload)) { derr = decodeErr(rp.payload); break; }
+            if (isEof(rp.payload)) { break; }
         }
+        if (!derr.isEmpty()) { return errorExec(derr); }
         return ExecResult(0, "OK");
     }
 }

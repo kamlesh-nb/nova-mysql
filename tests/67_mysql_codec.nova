@@ -75,6 +75,14 @@ fn test_err_packet_decode(): void {
     let err = mysql.decodeErr(ep);
     assert.equalStr(err.code, "42S02");
     assert.equalStr(err.message, "Table missing");
+
+    // T1: a decoded ERR packet now rides on the result (query/exec set rs.err / errorExec on 0xff).
+    let rs = db.errorResult(err);
+    assert.isTrue(rs.hasError());
+    assert.equalStr(rs.err.code, "42S02");
+    let xr = db.errorExec(err);
+    assert.isTrue(xr.hasError());
+    assert.isTrue(!db.ResultSet().hasError());
 }
 
 @test
