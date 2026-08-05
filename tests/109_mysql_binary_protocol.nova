@@ -8,7 +8,7 @@ import bytes;
 import string;
 import list;
 import db;
-import mysql;
+import codec;
 
 // Build a raw binary-row payload byte-by-byte: [0x00 header][null bitmap][values...].
 fn b(vals: List<int>): string {
@@ -21,7 +21,7 @@ fn b(vals: List<int>): string {
 @test
 fn test_stmt_prepare_frame(): void {
     // packet = [u24 len][seq 0][0x16 COM_STMT_PREPARE][sql]
-    let f = mysql.buildStmtPrepare("SELECT 1");
+    let f = codec.buildStmtPrepare("SELECT 1");
     // payload length = 1 (cmd) + 8 (sql) = 9
     assert.equalInt(f[0], 9);            // u24 low byte
     assert.equalInt(f[3], 0);            // seq
@@ -31,7 +31,7 @@ fn test_stmt_prepare_frame(): void {
 @test
 fn test_stmt_execute_frame_no_params(): void {
     // [len][seq][0x17][stmt_id u32][flags 0][iter u32=1]  -> payload 10 bytes
-    let f = mysql.buildStmtExecute(7, List<DbValue>());
+    let f = codec.buildStmtExecute(7, List<DbValue>());
     assert.equalInt(f[4], 23);           // 0x17 COM_STMT_EXECUTE
     assert.equalInt(f[5], 7);            // stmt_id low byte
     assert.equalInt(f[9], 0);            // flags
@@ -44,7 +44,7 @@ fn test_stmt_execute_binds_params(): void {
     let p = List<DbValue>();
     p.push(db.dbInt(5));
     p.push(db.dbText("hi"));
-    let f = mysql.buildStmtExecute(1, p);
+    let f = codec.buildStmtExecute(1, p);
     // Layout: [len 3][seq 1][cmd 1][stmt_id 4][flags 1][iter 4] = 14 header bytes, then:
     //   null bitmap (1) at 14, new_params_bound (1) at 15, param types (2 each) at 16..
     assert.equalInt(f[14], 0);           // null bitmap (no nulls)
@@ -69,7 +69,7 @@ fn test_binary_row_decode_int_and_string(): void {
     types.push(3);         // LONG
     types.push(253);       // VAR_STRING
     let payload = b(raw);
-    let row = mysql.decodeBinaryRow(payload, cols, types);
+    let row = codec.decodeBinaryRow(payload, cols, types);
     assert.equalInt(row.getLong(0), 42);
     assert.equalStr(row.getText(1), "hi");
 }
@@ -86,7 +86,7 @@ fn test_binary_row_decode_signed_negative(): void {
     let types = List<int>();
     types.push(1);         // TINY, signed (no unsigned bit)
     let payload = b(raw);
-    let row = mysql.decodeBinaryRow(payload, cols, types);
+    let row = codec.decodeBinaryRow(payload, cols, types);
     assert.equalInt(row.getInt(0), -1);
 }
 
@@ -105,7 +105,7 @@ fn test_binary_row_decode_null_via_bitmap(): void {
     types.push(253);
     types.push(253);
     let payload = b(raw);
-    let row = mysql.decodeBinaryRow(payload, cols, types);
+    let row = codec.decodeBinaryRow(payload, cols, types);
     assert.isTrue(row.isNull(0));
     assert.equalStr(row.getText(1), "ok");
 }

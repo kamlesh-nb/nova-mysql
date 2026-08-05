@@ -8,7 +8,7 @@ import bytes;
 import string;
 import list;
 import db;
-import mysql;
+import codec;
 
 fn u16leb(v: int): string { let p = bytes.alloc(2); bytes.write_byte(p,0,v%256); bytes.write_byte(p,1,(v/256)%256); return p as string; }
 fn u32leb(v: int): string { let p = bytes.alloc(4); bytes.write_byte(p,0,v%256); bytes.write_byte(p,1,(v/256)%256); bytes.write_byte(p,2,(v/65536)%256); bytes.write_byte(p,3,(v/16777216)%256); return p as string; }
@@ -17,24 +17,24 @@ fn b(v: int): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, v); return
 @test
 fn test_more_results_predicate(): void {
     // SERVER_MORE_RESULTS_EXISTS = 0x0008.
-    assert.isTrue(mysql.moreResultsExists(0x0008));
-    assert.isTrue(!mysql.moreResultsExists(0));
+    assert.isTrue(codec.moreResultsExists(0x0008));
+    assert.isTrue(!codec.moreResultsExists(0));
     // A different status bit (SERVER_STATUS_AUTOCOMMIT = 0x0002) must NOT read as "more results".
-    assert.isTrue(!mysql.moreResultsExists(0x0002));
+    assert.isTrue(!codec.moreResultsExists(0x0002));
     // Combined flags: autocommit + more-results -> true.
-    assert.isTrue(mysql.moreResultsExists(0x0002 + 0x0008));
+    assert.isTrue(codec.moreResultsExists(0x0002 + 0x0008));
 }
 
 @test
 fn test_eof_status_flags(): void {
     // EOF packet: 0xfe, warnings(u16), status_flags(u16). Set status = 0x0008 (more results).
     let eof = b(254) + u16leb(0) + u16leb(0x0008);
-    assert.equalInt(mysql.eofStatusFlags(eof), 0x0008);
-    assert.isTrue(mysql.moreResultsExists(mysql.eofStatusFlags(eof)));
+    assert.equalInt(codec.eofStatusFlags(eof), 0x0008);
+    assert.isTrue(codec.moreResultsExists(codec.eofStatusFlags(eof)));
 
     // Terminating EOF with no further result set: status flags cleared of 0x0008.
     let eofLast = b(254) + u16leb(0) + u16leb(0x0002);
-    assert.isTrue(!mysql.moreResultsExists(mysql.eofStatusFlags(eofLast)));
+    assert.isTrue(!codec.moreResultsExists(codec.eofStatusFlags(eofLast)));
 }
 
 @test
@@ -42,20 +42,20 @@ fn test_ok_status_flags(): void {
     // OK packet: 0x00, affected_rows(lenenc), last_insert_id(lenenc), status_flags(u16), warnings(u16).
     // affected=3, last_id=0, status=0x0008 (more results follow).
     let ok = b(0) + b(3) + b(0) + u16leb(0x0008) + u16leb(0);
-    assert.equalInt(mysql.okStatusFlags(ok), 0x0008);
-    assert.isTrue(mysql.moreResultsExists(mysql.okStatusFlags(ok)));
+    assert.equalInt(codec.okStatusFlags(ok), 0x0008);
+    assert.isTrue(codec.moreResultsExists(codec.okStatusFlags(ok)));
 
     // Last statement of a multi-statement run: no more-results bit.
     let okLast = b(0) + b(1) + b(0) + u16leb(0x0002) + u16leb(0);
-    assert.isTrue(!mysql.moreResultsExists(mysql.okStatusFlags(okLast)));
+    assert.isTrue(!codec.moreResultsExists(codec.okStatusFlags(okLast)));
 }
 
 @test
 fn test_build_kill_query(): void {
     // T8: KILL QUERY <connection_id> is what cancel() runs on the side connection.
-    assert.equalStr(mysql.buildKillQuery(42), "KILL QUERY 42");
-    assert.equalStr(mysql.buildKillQuery(1), "KILL QUERY 1");
-    assert.equalStr(mysql.buildKillQuery(123456), "KILL QUERY 123456");
+    assert.equalStr(codec.buildKillQuery(42), "KILL QUERY 42");
+    assert.equalStr(codec.buildKillQuery(1), "KILL QUERY 1");
+    assert.equalStr(codec.buildKillQuery(123456), "KILL QUERY 123456");
 }
 
 @test
@@ -65,7 +65,7 @@ fn test_handshake_connection_id_capture(): void {
         + u16leb(0) + b(45) + u16leb(2) + u16leb(0)
         + b(21) + b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)
         + "BBBBBBBBBBBB" + "mysql_native_password" + b(0);
-    let h = mysql.parseHandshake(hs);
+    let h = codec.parseHandshake(hs);
     assert.equalInt(h.connId, 7);
     assert.equalStr(h.salt, "AAAAAAAABBBBBBBBBBBB");   // salt still correct after reading conn-id
 
@@ -74,5 +74,5 @@ fn test_handshake_connection_id_capture(): void {
         + u16leb(0) + b(45) + u16leb(2) + u16leb(0)
         + b(21) + b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)
         + "BBBBBBBBBBBB" + "mysql_native_password" + b(0);
-    assert.equalInt(mysql.parseHandshake(hs2).connId, 305419896);
+    assert.equalInt(codec.parseHandshake(hs2).connId, 305419896);
 }

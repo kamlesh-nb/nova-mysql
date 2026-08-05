@@ -9,7 +9,9 @@ import bytes;
 import string;
 import list;
 import db;
-import mysql;
+import codec;
+import typemap;
+import auth;
 import crypto.hash.sha;
 
 // little-endian + lenenc builders (mirror the server encoding)
@@ -21,7 +23,7 @@ fn lstr(s: string): string { return b(s.length) + s; }   // lenenc-str (short fo
 @test
 fn test_comquery_framing(): void {
     // [u24 len LE][seq][0x03][sql]. sql "Q" -> payload len 2; frame = 3+1+2.
-    let f = mysql.buildComQuery("Q");
+    let f = codec.buildComQuery("Q");
     assert.equalInt(f.length, 6);
     assert.equalInt(f[0], 2);    // len low byte
     assert.equalInt(f[1], 0);
@@ -37,14 +39,14 @@ fn test_column_def_decode(): void {
     // + col_len(u32) + type(u8) ... type 3 = LONG -> Int4.
     let cd = lstr("def") + lstr("db") + lstr("t") + lstr("t") + lstr("id") + lstr("id")
         + b(12) + u16leb(63) + u32leb(11) + b(3);
-    let col = mysql.decodeColumnDef(cd);
+    let col = codec.decodeColumnDef(cd);
     assert.equalStr(col.name, "id");
     assert.isTrue(col.type_oid == DbType.Int4);
 
     // type 253 = VAR_STRING -> Text.
     let cd2 = lstr("def") + lstr("db") + lstr("t") + lstr("t") + lstr("name") + lstr("name")
         + b(12) + u16leb(45) + u32leb(255) + b(253);
-    assert.isTrue(mysql.decodeColumnDef(cd2).type_oid == DbType.Text);
+    assert.isTrue(codec.decodeColumnDef(cd2).type_oid == DbType.Text);
 }
 
 @test
@@ -56,14 +58,14 @@ fn test_text_row_decode(): void {
 
     // Row: id="10", name="widget", qty="42" (all lenenc-str, text protocol).
     let rp = lstr("10") + lstr("widget") + lstr("42");
-    let row = mysql.decodeTextRow(rp, cols);
+    let row = codec.decodeTextRow(rp, cols);
     assert.equalInt(row.getInt(0), 10);
     assert.equalStr(row.getText(1), "widget");
     assert.equalInt(row.getInt(2), 42);
 
     // Row with NULL name: id="20", NULL (0xfb), qty="7".
     let rp2 = lstr("20") + b(251) + lstr("7");
-    let row2 = mysql.decodeTextRow(rp2, cols);
+    let row2 = codec.decodeTextRow(rp2, cols);
     assert.equalInt(row2.getInt(0), 20);
     assert.isTrue(row2.isNull(1));
     assert.equalInt(row2.getInt(2), 7);
@@ -73,7 +75,7 @@ fn test_text_row_decode(): void {
 fn test_err_packet_decode(): void {
     // 0xff, error_code(u16), '#', sqlstate(5), message.
     let ep = b(255) + u16leb(1146) + b(35) + "42S02" + "Table missing";
-    let err = mysql.decodeErr(ep);
+    let err = codec.decodeErr(ep);
     assert.equalStr(err.code, "42S02");
     assert.equalStr(err.message, "Table missing");
 
@@ -95,7 +97,7 @@ fn test_handshake_salt_extraction(): void {
         + u16leb(0) + b(45) + u16leb(2) + u16leb(0)
         + b(21) + b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)
         + "BBBBBBBBBBBB" + "mysql_native_password" + b(0);
-    let h = mysql.parseHandshake(hs);
+    let h = codec.parseHandshake(hs);
     assert.equalStr(h.salt, "AAAAAAAABBBBBBBBBBBB");   // salt1 ++ salt2 = 20 bytes
     assert.equalStr(h.plugin, "mysql_native_password");
 }
@@ -108,7 +110,7 @@ fn test_native_password_scramble_golden(): void {
     let i = 0;
     while (i < 20) { bytes.write_byte(sb, i, i + 1); i = i + 1; }
     let salt = sb as string;
-    let out = mysql.mysqlNativeScramble("secret", salt);
+    let out = auth.mysqlNativeScramble("secret", salt);
     assert.equalInt(out.length, 20);
     let gp = out as ptr;
     assert.equalInt(bytes.read_byte(gp, 0), 179);
@@ -120,7 +122,7 @@ fn test_native_password_scramble_golden(): void {
 @test
 fn test_ssl_request_frame(): void {
     // T2: SSLRequest = [u24 len=32 LE][seq][32-byte trunc HandshakeResponse41 with CLIENT_SSL].
-    let f = mysql.buildSSLRequest(2048 + 8, 1);   // caps with CLIENT_SSL(0x800) set
+    let f = codec.buildSSLRequest(2048 + 8, 1);   // caps with CLIENT_SSL(0x800) set
     assert.equalInt(f.length, 36);   // 3 (len) + 1 (seq) + 32 (body)
     assert.equalInt(f[0], 32);       // payload length low byte
     assert.equalInt(f[1], 0); assert.equalInt(f[2], 0);
@@ -135,7 +137,7 @@ fn test_text_datetime_decode(): void {
     let cols = List<Column>();
     cols.push(Column("ts", DbType.Timestamp));
     let rp = lstr("2024-01-01 10:00:00");
-    let row = mysql.decodeTextRow(rp, cols);
+    let row = codec.decodeTextRow(rp, cols);
     assert.equalStr(row.getTimestamp(0), "2024-01-01 10:00:00");
 }
 
@@ -145,10 +147,10 @@ fn test_multidigit_param_and_blob(): void {
     let p = List<DbValue>();
     let i = 0;
     while (i < 12) { p.push(db.dbInt(i + 1)); i = i + 1; }
-    assert.equalStr(mysql.substituteParams("VALUES ($1, $10, $12)", p), "VALUES (1, 10, 12)");
+    assert.equalStr(typemap.substituteParams("VALUES ($1, $10, $12)", p), "VALUES (1, 10, 12)");
     let pb = List<DbValue>();
     pb.push(db.dbBlob("Hi"));
-    assert.equalStr(mysql.substituteParams("$1", pb), "x'4869'");
+    assert.equalStr(typemap.substituteParams("$1", pb), "x'4869'");
 }
 
 @test
@@ -168,12 +170,12 @@ fn test_multipacket_reassembly(): void {
     // second header: u24 len = 5 (5,0,0), seq 1
     bytes.write_byte(buf, off2, small); bytes.write_byte(buf, off2 + 1, 0); bytes.write_byte(buf, off2 + 2, 0);
     bytes.write_byte(buf, off2 + 3, 1);
-    let joined = mysql.reassemblePayload(buf as string, 0);
+    let joined = codec.reassemblePayload(buf as string, 0);
     assert.equalInt(joined.length, big + small);
 
     // A single packet with len < 0xFFFFFF is returned as-is (no continuation).
     let sp = b(3) + b(0) + b(0) + b(7) + "abc";   // len 3, seq 7, body "abc"
-    assert.equalStr(mysql.reassemblePayload(sp, 0), "abc");
+    assert.equalStr(codec.reassemblePayload(sp, 0), "abc");
 
     // A continuation followed by a 0-length terminator packet stops the run at the empty packet.
     let big2 = 16777215;
@@ -181,7 +183,7 @@ fn test_multipacket_reassembly(): void {
     let tbuf = bytes.alloc(t2);
     bytes.write_byte(tbuf, 0, 255); bytes.write_byte(tbuf, 1, 255); bytes.write_byte(tbuf, 2, 255);
     // trailing header is len 0 (already zeroed) at offset 4+big2
-    let joined2 = mysql.reassemblePayload(tbuf as string, 0);
+    let joined2 = codec.reassemblePayload(tbuf as string, 0);
     assert.equalInt(joined2.length, big2);
 }
 
@@ -197,7 +199,7 @@ fn test_caching_sha2_scramble_roundtrip(): void {
     let nonce = sb as string;
     let pw = "secret";
 
-    let token = mysql.cachingSha2Scramble(pw, nonce);
+    let token = auth.cachingSha2Scramble(pw, nonce);
     assert.equalInt(token.length, 32);
 
     // Recompute the inner hash independently via the crypto/hash/sha256 primitive.
@@ -214,7 +216,7 @@ fn test_caching_sha2_scramble_roundtrip(): void {
     }
 
     // Consistency: cachingSha2Scramble is the same wire scramble as mysqlSha2Scramble.
-    let alt = mysql.mysqlSha2Scramble(pw, nonce);
+    let alt = auth.mysqlSha2Scramble(pw, nonce);
     let ap = alt as ptr;
     let m = 0;
     while (m < 32) { assert.equalInt(bytes.read_byte(tp, m), bytes.read_byte(ap, m)); m = m + 1; }
