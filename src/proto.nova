@@ -49,7 +49,24 @@ async fn fill(r: MyReader): bool {
     r.len = r.len + n;
     return true;
 }
+// Grow the reader ring to hold at least `k` bytes resident, preserving the live [pos,len) window.
+// Without this a single value/packet larger than the initial 64 KB ring could never be read (fill's
+// `space` would be 0 and recvInto(_, 0) returns 0 -> need fails). MySQL packet bodies cap at 16 MB.
+fn growBuf(r: MyReader, k: int): void {
+    let newcap = r.cap;
+    while (newcap < k) { newcap = newcap * 2; }
+    let nb = bytes.alloc(newcap);
+    let live = r.len - r.pos;
+    let i = 0;
+    while (i < live) { bytes.write_byte(nb, i, bytes.read_byte(r.buf, r.pos + i)); i = i + 1; }
+    bytes.free(r.buf);
+    r.buf = nb;
+    r.cap = newcap;
+    r.len = live;
+    r.pos = 0;
+}
 async fn need(r: MyReader, k: int): bool {
+    if (k > r.cap) { growBuf(r, k); }
     while (r.len - r.pos < k) { if (!(await fill(r))) { return false; } }
     return true;
 }

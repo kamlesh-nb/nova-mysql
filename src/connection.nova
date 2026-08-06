@@ -10,7 +10,7 @@ pub struct ConnectionOptions {
     pub user: string,
     pub password: string,
     pub database: string,
-    pub sslmode: string,       // "disable" (default) | "require" | "verify-full"
+    pub sslmode: string,       // "disable" (default) | "skip-verify" (encrypt, no verify) | "require" | "verify-ca" | "verify-full" (all verify the CA bundle, fail closed)
     pub sslrootcert: string,   // PEM CA bundle path (verify-full)
     init(host: string, port: int, user: string, password: string, database: string, sslmode: string, sslrootcert: string) {
         self.host = host; self.port = port; self.user = user;

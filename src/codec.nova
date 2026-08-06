@@ -304,16 +304,48 @@ pub fn buildStmtExecute(stmtId: int, params: List<DbValue>): string {
         }
         let nmStr = nullmap as string;                 // owned local so the buffer is freed (not leaked)
         body = body + nmStr + u8b(1);                  // bitmap + new_params_bound_flag
-        i = 0;
-        while (i < np) { body = body + u8b(253) + u8b(0); i = i + 1; }   // all params VAR_STRING
+        // Type array: each param gets its NATIVE binary type + unsigned flag, so the value below is sent
+        // typed-binary (exact) rather than as VAR_STRING text relying on server coercion (D3).
         i = 0;
         while (i < np) {
             let p = params.get(i) ?? db.dbNull();
-            if (!p.isNull()) { body = body + lenencStrFull(typemap.valueToBindText(p)); }
+            body = body + u8b(bindType(p)) + u8b(0);
+            i = i + 1;
+        }
+        // Value section: each non-null param in its binary wire form.
+        i = 0;
+        while (i < np) {
+            let p = params.get(i) ?? db.dbNull();
+            if (!p.isNull()) { body = body + bindValue(p); }
             i = i + 1;
         }
     }
     return packet(0, body);
+}
+// Write a 64-bit value as 8 little-endian bytes (`>>` + mask is sign-safe for the low byte each step).
+fn u64le8(v: long): string {
+    let p = bytes.alloc(8);
+    let i = 0;
+    while (i < 8) { bytes.write_byte(p, i, ((v >> (8 * i)) & 255) as int); i = i + 1; }
+    return p as string;
+}
+// MySQL binary-protocol field type for a bound param.
+fn bindType(p: DbValue): int {
+    if (p.kind == DbType.Bool) { return 1; }                               // MYSQL_TYPE_TINY
+    if (p.kind == DbType.Int4 || p.kind == DbType.Int8) { return 8; }      // MYSQL_TYPE_LONGLONG (8-byte)
+    if (p.kind == DbType.Float4 || p.kind == DbType.Float8) { return 5; }  // MYSQL_TYPE_DOUBLE
+    if (p.kind == DbType.Decimal) { return 246; }                          // MYSQL_TYPE_NEWDECIMAL (ASCII)
+    if (p.kind == DbType.Blob) { return 252; }                             // MYSQL_TYPE_BLOB
+    return 253;                                                            // MYSQL_TYPE_VAR_STRING (text/ts/uuid)
+}
+// Binary value bytes for a non-null bound param, matching bindType.
+fn bindValue(p: DbValue): string {
+    if (p.kind == DbType.Bool) { return u8b(if (p.asBool()) 1 else 0); }
+    if (p.kind == DbType.Int4 || p.kind == DbType.Int8) { return u64le8(p.asLong()); }
+    if (p.kind == DbType.Float4 || p.kind == DbType.Float8) { return u64le8(nova_f64_bits(p.asDouble())); }
+    if (p.kind == DbType.Decimal) { return lenencStrFull(p.asText()); }    // NEWDECIMAL wire form is ASCII
+    if (p.kind == DbType.Blob) { return lenencStrFull(p.asText()); }
+    return lenencStrFull(typemap.valueToBindText(p));                      // text / timestamp / uuid
 }
 
 // Read `n` little-endian bytes into a 64-bit value.
@@ -351,8 +383,16 @@ fn decodeBinaryCell(c: MyCursor, tf: int): DbValue {
         return db.dbLong(if (uns) v else signExtend(v, 4));
     }
     if (t == 8) {                                   // LONGLONG (8 bytes)
-        let v = readLE(c, 8);
-        return db.dbLong(v);                        // (unsigned > i63 wraps — MySQL edge case)
+        let lo = readLE(c, 4);                      // low 32 bits (0 .. 2^32-1)
+        let hi = readLE(c, 4);                      // high 32 bits
+        let v = hi * 4294967296 + lo;               // wraps to the correct 2's-complement i64 bit pattern
+        // Unsigned LONGLONG >= 2^63 would appear negative in an i64: represent it EXACTLY as a decimal
+        // (via u64 = hi*2^32 + lo) instead of silently wrapping to a negative number.
+        if (uns && v < 0) {
+            let d = decimal.fromString(`${hi}`) * 4294967296m + decimal.fromString(`${lo}`);
+            return DbValue(DbType.Decimal, 0, 0.0, d, `${d}`);   // set text form so getText works too
+        }
+        return db.dbLong(v);
     }
     if (t == 4) {                                   // FLOAT (4 IEEE bytes)
         let raw = c.take(4);
@@ -369,12 +409,34 @@ fn decodeBinaryCell(c: MyCursor, tf: int): DbValue {
     if (t == 10 || t == 7 || t == 12) {             // DATE / TIMESTAMP / DATETIME (binary)
         return db.dbTimestamp(decodeBinaryDateTime(c));
     }
+    if (t == 11) {                                  // TIME (binary) — NOT a lenenc string
+        return db.dbText(decodeBinaryTime(c));
+    }
     // STRING / VAR_STRING / VARCHAR / BLOB / JSON / etc. -> lenenc string
     return db.dbText(c.lenencStr());
 }
 
 // Binary DATE/DATETIME/TIMESTAMP: a lenenc length (0/4/7/11) then year(2) month(1) day(1)
 // [hour(1) min(1) sec(1)] [microsec(4)] -> "YYYY-MM-DD HH:MM:SS".
+// Binary-protocol TIME: [len][is_neg][days u32][h][m][s]([micros u32] when len==12). Total hours =
+// days*24 + h. Previously this fell through to lenencStr and mis-read the structure (stream desync).
+fn decodeBinaryTime(c: MyCursor): string {
+    let len = c.lenenc();
+    if (len == 0) { return "00:00:00"; }
+    let neg = c.byte();
+    let days = c.u32();
+    let hh = c.byte(); let mm = c.byte(); let ss = c.byte();
+    let micro = 0;
+    if (len >= 12) {
+        let m0 = c.byte(); let m1 = c.byte(); let m2 = c.byte(); let m3 = c.byte();
+        micro = m0 + m1 * 256 + m2 * 65536 + m3 * 16777216;
+    }
+    let totalH = days * 24 + hh;
+    let sign = if (neg == 1) "-" else "";
+    let t = `${sign}${pad2(totalH)}:${pad2(mm)}:${pad2(ss)}`;
+    if (micro > 0) { return `${t}.${pad6(micro)}`; }
+    return t;
+}
 fn decodeBinaryDateTime(c: MyCursor): string {
     let len = c.lenenc();
     if (len == 0) { return "0000-00-00"; }
@@ -430,14 +492,27 @@ pub fn decodeBinaryRow(payload: string, cols: List<Column>, types: List<int>): R
 pub fn decodeErr(payload: string): DbError {
     let c = MyCursor(payload);
     c.skip(1);            // 0xff
-    c.u16();              // error code
+    let number = c.u16(); // error code (was discarded)
     let code = "";
     if (c.remaining() > 0 && c.s[c.pos] == 35) {   // '#'
         c.skip(1);
         code = c.take(5);
     }
     let msg = c.take(c.remaining());
-    return DbError(code, msg);
+    return DbError(code, msg).with(number, classifyMyErr(number));
+}
+// Map a MySQL error number onto the normalized db.DBERR_* taxonomy.
+fn classifyMyErr(n: int): int {
+    if (n == 1062) { return db.DBERR_UNIQUE_VIOLATION; }              // ER_DUP_ENTRY
+    if (n == 1048) { return db.DBERR_NOT_NULL; }                     // ER_BAD_NULL_ERROR
+    if (n == 1451 || n == 1452) { return db.DBERR_FOREIGN_KEY; }    // FK parent/child
+    if (n == 3819) { return db.DBERR_CHECK; }                       // ER_CHECK_CONSTRAINT_VIOLATED
+    if (n == 1213) { return db.DBERR_DEADLOCK; }                    // ER_LOCK_DEADLOCK
+    if (n == 1205) { return db.DBERR_LOCK_TIMEOUT; }                // ER_LOCK_WAIT_TIMEOUT
+    if (n == 1064 || n == 1146 || n == 1054) { return db.DBERR_SYNTAX; } // syntax / no table / bad col
+    if (n == 1045 || n == 1044) { return db.DBERR_AUTH; }           // access denied
+    if (n == 2002 || n == 2003 || n == 2006 || n == 2013) { return db.DBERR_CONNECTION; }
+    return db.DBERR_UNKNOWN;
 }
 
 // An OK packet reports affected_rows (lenenc) + last_insert_id (lenenc). First byte 0x00.

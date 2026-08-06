@@ -35,6 +35,33 @@ import auth;
 
 // --- The seam implementation --------------------------------------------------
 
+// The result of rewriting seam-style `$N` placeholders to MySQL-native `?` for COM_STMT_PREPARE,
+// with the params reordered into placeholder-appearance order (handles reuse / out-of-order $N).
+struct ConvQ {
+    pub sql: string,
+    pub params: List<DbValue>,
+    init(sql: string, params: List<DbValue>) { self.sql = sql; self.params = params; }
+}
+fn convertDollarParams(sql: string, params: List<DbValue>): ConvQ {
+    let out = "";
+    let np = List<DbValue>();
+    let i = 0;
+    while (i < sql.length) {
+        if (sql[i] == 36 && i + 1 < sql.length && sql[i + 1] >= 48 && sql[i + 1] <= 57) {   // `$` + digit
+            let j = i + 1;
+            let num = 0;
+            while (j < sql.length && sql[j] >= 48 && sql[j] <= 57) { num = num * 10 + (sql[j] - 48); j = j + 1; }
+            out = out + "?";
+            np.push(params.get(num - 1) ?? db.dbNull());
+            i = j;
+        } else {
+            out = out + string.slice(sql, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return ConvQ(out, np);
+}
+
 pub struct MyConnection impl Connection {
     pub io: aio.AsyncIO,
     pub reader: MyReader,
@@ -42,6 +69,8 @@ pub struct MyConnection impl Connection {
     pub busy: bool,   // concurrency guard: one in-flight request per connection
     pub connId: int,  // T8: server's thread id (from the handshake) — the KILL QUERY target
     pub connectionString: string,  // T8: the DSN so cancel() can open a SEPARATE side connection
+    pub failed: bool,             // set when connect failed closed (e.g. TLS verify failed under require)
+    pub failErr: string,          // the failure reason surfaced to the first query/exec
     init(io: aio.AsyncIO, reader: MyReader) {
         self.io = io;
         self.reader = reader;
@@ -49,7 +78,10 @@ pub struct MyConnection impl Connection {
         self.busy = false;
         self.connId = 0;
         self.connectionString = "";
+        self.failed = false;
+        self.failErr = "";
     }
+    pub fn markFailed(self, why: string): void { self.failed = true; self.failErr = why; }
 
     // T8 query cancellation. MySQL cancels an in-flight query by opening a SEPARATE connection and
     // running `KILL QUERY <connection_id>` (the running connection is blocked on the server, so the
@@ -64,9 +96,19 @@ pub struct MyConnection impl Connection {
     }
 
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        if (self.failed) { return errorResult(DbError("", self.failErr)); }
         if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        await proto.sendPacket(self.io, codec.buildComQuery(typemap.substituteParams(sql, params)));
+        // SECURITY: with params, bind them SERVER-SIDE via a prepared statement (COM_STMT_EXECUTE)
+        // instead of interpolating into SQL text -- injection is then structurally impossible.
+        // No-param SQL keeps the plain COM_QUERY path (multi-statement / DDL).
+        if (params.size() > 0) {
+            let cq = convertDollarParams(sql, params);
+            let rs = await self.runBound(cq.sql, cq.params);
+            self.busy = false;
+            return rs;
+        }
+        await proto.sendPacket(self.io, codec.buildComQuery(sql));
         let rs = ResultSet();
         // T14 Feature 1: multi-resultset. A multi-statement query or stored procedure yields several
         // result sets back-to-back; each terminating OK/EOF sets SERVER_MORE_RESULTS_EXISTS (0x0008)
@@ -119,9 +161,18 @@ pub struct MyConnection impl Connection {
     }
 
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.failed) { return errorExec(DbError("", self.failErr)); }
         if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        await proto.sendPacket(self.io, codec.buildComQuery(typemap.substituteParams(sql, params)));
+        // Same server-bound-param path as query() (see the SECURITY note there).
+        if (params.size() > 0) {
+            let cq = convertDollarParams(sql, params);
+            let rs = await self.runBound(cq.sql, cq.params);
+            self.busy = false;
+            if (!rs.err.isEmpty()) { return errorExec(rs.err); }
+            return ExecResult(rs.rows_affected, "OK");
+        }
+        await proto.sendPacket(self.io, codec.buildComQuery(sql));
         let p = await proto.readPacket(self.reader);
         if (!p.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
         if (codec.isErr(p.payload)) { self.busy = false; return errorExec(codec.decodeErr(p.payload)); }
@@ -187,15 +238,23 @@ pub struct MyConnection impl Connection {
 
     pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
         if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
+        if (stmt < 0 || stmt >= self.stmts.size()) { return ResultSet(); }
         self.busy = true;
-        let rs = ResultSet();
-        if (stmt < 0 || stmt >= self.stmts.size()) { self.busy = false; return rs; }
         let s = self.stmts.get(stmt) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        let rs = await self.execStmtRaw(s, params);
+        self.busy = false;
+        return rs;
+    }
+    // Run COM_STMT_EXECUTE for an already-prepared statement and decode the binary result set. Does NOT
+    // touch the busy guard (the caller owns it), so both queryPrepared and query()'s server-bound-param
+    // path can share it. Params are bound in the EXECUTE packet -- never interpolated into SQL.
+    async fn execStmtRaw(self, s: MyStmt, params: List<DbValue>): ResultSet {
+        let rs = ResultSet();
         await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, params));
         let first = await proto.readPacket(self.reader);
-        if (!first.ok) { rs.err = DbError("", "connection read failed"); self.busy = false; return rs; }
-        if (codec.isErr(first.payload)) { rs.err = codec.decodeErr(first.payload); self.busy = false; return rs; }
-        if (codec.isOk(first.payload)) { rs.rows_affected = codec.okAffectedRows(first.payload); self.busy = false; return rs; }
+        if (!first.ok) { rs.err = DbError("", "connection read failed"); return rs; }
+        if (codec.isErr(first.payload)) { rs.err = codec.decodeErr(first.payload); return rs; }
+        if (codec.isOk(first.payload)) { rs.rows_affected = codec.okAffectedRows(first.payload); return rs; }
         // column_count(lenenc), then column defs + EOF, then BINARY rows until EOF.
         let cc = codec.MyCursor(first.payload);
         let ncols = cc.lenenc();
@@ -219,8 +278,15 @@ pub struct MyConnection impl Connection {
         }
         rs.rows_affected = rs.rows.size();
         rs.tag = `SELECT ${rs.rows.size()}`;
-        self.busy = false;
         return rs;
+    }
+    // Ensure `sql` (already `?`-placeholdered) is prepared and run it with `params` bound server-side.
+    // Assumes the caller holds the busy guard.
+    async fn runBound(self, sql: string, params: List<DbValue>): ResultSet {
+        let h = await self.prepare(sql);
+        if (h < 0) { let rs = ResultSet(); rs.err = DbError("", "prepare failed"); return rs; }
+        let s = self.stmts.get(h) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        return await self.execStmtRaw(s, params);
     }
 
     pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
@@ -287,14 +353,23 @@ async fn myConnectAsync(connectionString: string): MyConnection {
         }
         let sslCaps = auth.clientCapabilities() + codec.CLIENT_SSL;
         await proto.sendPacket(stream, codec.buildSSLRequest(sslCaps, hp.seq + 1));
-        if (string.eql(d.sslmode, "verify-full")) {
+        // TLS trust policy. `skip-verify` is the ONLY mode that encrypts without validating the server
+        // certificate; `require`/`verify-ca`/`verify-full` all verify the chain against the CA bundle
+        // (sslrootcert) and FAIL CLOSED if it does not validate. Previously `require` silently used the
+        // no-verify path -- a MITM with any cert defeated it, so it was a trust downgrade.
+        if (!string.eql(d.sslmode, "skip-verify")) {
             let caPem = if (d.sslrootcert != "") File.readText(d.sslrootcert) else "";
             let ts = await asynctls.tlsClientUpgradeVerify(stream, d.host, caPem);
+            if (!ts.ok()) {
+                let dead = MyConnection(ts, reader);
+                dead.markFailed("mysql: TLS certificate verification failed for sslmode=" + d.sslmode + " (set sslrootcert, or use sslmode=skip-verify to opt out)");
+                return dead;
+            }
             reader.io = ts;
             await proto.sendPacket(ts, codec.buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
             return await myAuthFinish(ts, reader, d, hs.salt, hs.connId, connectionString);
         }
-        let ts2 = await asynctls.tlsClientUpgrade(stream, d.host);
+        let ts2 = await asynctls.tlsClientUpgrade(stream, d.host);   // skip-verify: encrypt, no validation
         reader.io = ts2;
         await proto.sendPacket(ts2, codec.buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
         return await myAuthFinish(ts2, reader, d, hs.salt, hs.connId, connectionString);
