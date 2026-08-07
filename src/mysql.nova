@@ -479,9 +479,10 @@ async fn myConnectAsync(connectionString: string): MyConnection {
         // certificate; `require`/`verify-ca`/`verify-full` all verify the chain against the CA bundle
         // (sslrootcert) and FAIL CLOSED if it does not validate. Previously `require` silently used the
         // no-verify path -- a MITM with any cert defeated it, so it was a trust downgrade.
+        let tlsToMs = connection.connectTimeoutMs(connectionString);
         if (!string.eql(d.sslmode, "skip-verify")) {
             let caPem = if (d.sslrootcert != "") File.readText(d.sslrootcert) else "";
-            let ts = await asynctls.tlsClientUpgradeVerify(stream, d.host, caPem);
+            let ts = await asynctls.tlsClientUpgradeVerifyDeadline(stream, d.host, caPem, tlsToMs);
             if (!ts.ok()) {
                 let dead = MyConnection(ts, reader);
                 dead.markFailed("mysql: TLS certificate verification failed for sslmode=" + d.sslmode + " (set sslrootcert, or use sslmode=skip-verify to opt out)");
@@ -491,7 +492,7 @@ async fn myConnectAsync(connectionString: string): MyConnection {
             await proto.sendPacket(ts, codec.buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
             return await myAuthFinish(ts, reader, d, hs.salt, hs.connId, connectionString);
         }
-        let ts2 = await asynctls.tlsClientUpgrade(stream, d.host);   // skip-verify: encrypt, no validation
+        let ts2 = await asynctls.tlsClientUpgradeDeadline(stream, d.host, tlsToMs);   // skip-verify: encrypt, no validation
         reader.io = ts2;
         await proto.sendPacket(ts2, codec.buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
         return await myAuthFinish(ts2, reader, d, hs.salt, hs.connId, connectionString);
