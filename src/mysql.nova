@@ -250,7 +250,7 @@ pub struct MyConnection impl Connection {
     // path can share it. Params are bound in the EXECUTE packet -- never interpolated into SQL.
     async fn execStmtRaw(self, s: MyStmt, params: List<DbValue>): ResultSet {
         let rs = ResultSet();
-        await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, params));
+        await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, params, false));
         let first = await proto.readPacket(self.reader);
         if (!first.ok) { rs.err = DbError("", "connection read failed"); return rs; }
         if (codec.isErr(first.payload)) { rs.err = codec.decodeErr(first.payload); return rs; }
@@ -294,7 +294,7 @@ pub struct MyConnection impl Connection {
         self.busy = true;
         if (stmt < 0 || stmt >= self.stmts.size()) { self.busy = false; return ExecResult(0, ""); }
         let s = self.stmts.get(stmt) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
-        await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, params));
+        await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, params, false));
         let p = await proto.readPacket(self.reader);
         if (!p.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
         if (codec.isErr(p.payload)) { self.busy = false; return errorExec(codec.decodeErr(p.payload)); }
@@ -316,6 +316,98 @@ pub struct MyConnection impl Connection {
         self.busy = false;
         return ExecResult(0, "OK");
     }
+
+    // --- X4: true streaming via a server-side read-only cursor ----------------
+    // Stream a query's rows in server-fetched batches (COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY, then
+    // COM_STMT_FETCH(batchSize) until the terminating EOF sets SERVER_STATUS_LAST_ROW_SENT). The server
+    // keeps the result set on its side and yields `batchSize` rows per fetch, so a large table never
+    // buffers in full. Iterate:
+    //   let cur = await conn.queryStream("SELECT ...", params, 500);
+    //   while (let row = await cur.next()) { ... }
+    //   let _ = await cur.close();
+    // batchSize <= 0 defaults to 100. The connection stays busy until the cursor is drained or closed.
+    pub async fn queryStream(self, sql: string, params: List<DbValue>, batchSize: int): Cursor {
+        if (self.failed) { return cursorOver(errorResult(DbError("", self.failErr))); }
+        if (self.busy) { return cursorOver(errorResult(DbError("", "connection busy: concurrent use"))); }
+        self.busy = true;
+        let bs = if (batchSize > 0) batchSize else 100;
+        let cq = convertDollarParams(sql, params);
+        let h = await self.prepare(cq.sql);
+        if (h < 0) { self.busy = false; return cursorOver(errorResult(DbError("", "prepare failed"))); }
+        let s = self.stmts.get(h) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, cq.params, true));   // open a read-only cursor
+        let first = await proto.readPacket(self.reader);
+        if (!first.ok) { self.busy = false; return cursorOver(errorResult(DbError("", "connection read failed"))); }
+        if (codec.isErr(first.payload)) { let e = codec.decodeErr(first.payload); self.busy = false; return cursorOver(errorResult(e)); }
+        if (codec.isOk(first.payload)) { self.busy = false; return cursorOver(ResultSet()); }   // no result set
+        // column_count(lenenc), then column defs, then the cursor-open EOF (SERVER_STATUS_CURSOR_EXISTS).
+        let cc = codec.MyCursor(first.payload);
+        let ncols = cc.lenenc();
+        let cols = List<Column>();
+        let colTypes = List<int>();
+        let i = 0;
+        while (i < ncols) {
+            let cp = await proto.readPacket(self.reader);
+            cols.push(codec.decodeColumnDef(cp.payload));
+            colTypes.push(codec.columnTypeRaw(cp.payload));
+            i = i + 1;
+        }
+        let eof1 = await proto.readPacket(self.reader);
+        let src: RowBatchSource = MyRowSource(self, s.id, cols, colTypes, bs);
+        return Cursor(src);
+    }
+}
+
+// A lazy row source over a MySQL server-side read-only cursor: each fetchBatch issues COM_STMT_FETCH for
+// `batchSize` rows and decodes the binary row packets until the batch's EOF. When that EOF carries
+// SERVER_STATUS_LAST_ROW_SENT (0x0080) the cursor is exhausted (MySQL closes it server-side); an early
+// close() sends COM_STMT_RESET to discard the rest without leaking the cursor.
+pub struct MyRowSource impl RowBatchSource {
+    pub conn: MyConnection,
+    pub stmtId: int,
+    pub cols: List<Column>,
+    pub colTypes: List<int>,
+    pub batchSize: int,
+    pub done: bool,
+    pub e: DbError,
+    init(conn: MyConnection, stmtId: int, cols: List<Column>, colTypes: List<int>, batchSize: int) {
+        self.conn = conn; self.stmtId = stmtId; self.cols = cols; self.colTypes = colTypes;
+        self.batchSize = batchSize; self.done = false; self.e = noError();
+    }
+
+    async fn fetchBatch(self: MyRowSource): List<Row> {
+        let rows = List<Row>();
+        if (self.done) { return rows; }
+        await proto.sendPacket(self.conn.io, codec.buildStmtFetch(self.stmtId, self.batchSize));
+        while (true) {
+            let rp = await proto.readPacket(self.conn.reader);
+            if (!rp.ok) { self.done = true; self.conn.busy = false; break; }
+            if (codec.isErr(rp.payload)) { self.e = codec.decodeErr(rp.payload); self.done = true; self.conn.busy = false; break; }
+            if (codec.isEof(rp.payload)) {
+                // The fetch's terminating EOF: LAST_ROW_SENT means the whole result has been read.
+                if ((codec.eofStatusFlags(rp.payload) & 0x0080) != 0) { self.done = true; self.conn.busy = false; }
+                break;
+            }
+            rows.push(codec.decodeBinaryRow(rp.payload, self.cols, self.colTypes));
+        }
+        return rows;
+    }
+    fn columns(self: MyRowSource): List<Column> { return self.cols; }
+    fn err(self: MyRowSource): DbError { return self.e; }
+    async fn close(self: MyRowSource): void {
+        if (!self.done) {
+            await proto.sendPacket(self.conn.io, codec.buildStmtReset(self.stmtId));   // discard the open cursor
+            let _rp = await proto.readPacket(self.conn.reader);                          // OK
+            self.done = true;
+            self.conn.busy = false;
+        }
+    }
+}
+
+/// Connect and return the CONCRETE MyConnection (so callers can reach queryStream and any mysql-specific
+/// helpers). Driver.connect returns the Connection trait; this is the mysql analogue of mongodb.open.
+pub async fn open(connectionString: string): MyConnection {
+    return await myConnectAsync(connectionString);
 }
 
 /// The MySQL driver. connection string: `mysql://user[:password]@host[:port]/database`. Reads the server

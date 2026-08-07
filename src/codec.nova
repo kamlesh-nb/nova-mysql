@@ -281,13 +281,19 @@ fn lenencStrFull(s: string): string { return lenencInt(s.length) + s; }
 pub fn buildStmtPrepare(sql: string): string { return packet(0, u8b(22) + sql); }
 // COM_STMT_CLOSE (0x19) + statement id.
 fn buildStmtClose(stmtId: int): string { return packet(0, u8b(25) + u32le(stmtId)); }
+// COM_STMT_FETCH (0x1c): stmt_id + num_rows -- fetch the next `numRows` from an OPEN server-side cursor
+// (opened by COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY). This is the X4 streaming primitive.
+pub fn buildStmtFetch(stmtId: int, numRows: int): string { return packet(0, u8b(28) + u32le(stmtId) + u32le(numRows)); }
+// COM_STMT_RESET (0x1a): drop an open cursor's remaining rows + reset the statement, keeping it prepared
+// (unlike COM_STMT_CLOSE). Used to abandon a stream early without leaking the server-side cursor.
+pub fn buildStmtReset(stmtId: int): string { return packet(0, u8b(26) + u32le(stmtId)); }
 
-// COM_STMT_EXECUTE (0x17): stmt_id, flags=0 (no cursor), iteration_count=1, then — if there are
-// params — the NULL bitmap, new-params-bound=1, each param's type (VAR_STRING), then each
+// COM_STMT_EXECUTE (0x17): stmt_id, flags (0 = no cursor, 1 = CURSOR_TYPE_READ_ONLY), iteration_count=1,
+// then — if there are params — the NULL bitmap, new-params-bound=1, each param's type, then each
 // non-null param value as a lenenc string.
-pub fn buildStmtExecute(stmtId: int, params: List<DbValue>): string {
+pub fn buildStmtExecute(stmtId: int, params: List<DbValue>, cursor: bool): string {
     let np = params.size();
-    let body = u8b(23) + u32le(stmtId) + u8b(0) + u32le(1);
+    let body = u8b(23) + u32le(stmtId) + u8b(if (cursor) 1 else 0) + u32le(1);
     if (np > 0) {
         let nbytes = (np + 7) / 8;
         let nullmap = bytes.alloc(nbytes);
