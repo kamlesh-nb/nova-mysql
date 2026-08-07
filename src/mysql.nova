@@ -441,8 +441,13 @@ pub async fn open(connectionString: string): MyConnection {
 // Whole connect + auth handshake as ONE async fn, driven once by the sync Driver.connect.
 async fn myConnectAsync(connectionString: string): MyConnection {
         let d = connection.parse(connectionString);
-        let stream = await aio.asyncConnect(d.host, d.port);
+        let stream = await aio.asyncConnectDeadline(d.host, d.port, connection.connectTimeoutMs(connectionString));
         let reader = MyReader(stream);
+        if (!stream.ok()) {
+            let dead = MyConnection(stream, reader);
+            dead.markFailed("connect timed out or refused: " + d.host + ":" + `${d.port}`);
+            return dead;
+        }
 
         let hp = await proto.readPacket(reader);
         let hs = codec.parseHandshake(hp.payload);
