@@ -120,6 +120,17 @@ pub struct MyConnection impl Connection {
             let first = await proto.readPacket(self.reader);
             if (!first.ok) { rs.err = DbError("", "connection read failed"); self.busy = false; return rs; }
             if (codec.isErr(first.payload)) { rs.err = codec.decodeErr(first.payload); self.busy = false; return rs; }
+            if (codec.isLocalInfile(first.payload)) {
+                // The server asked us to stream a local file (LOAD DATA LOCAL INFILE). We do not
+                // support it; send an empty file body so the server finishes the request cleanly (an
+                // OK/ERR follows), then surface an error instead of desyncing the row stream.
+                await proto.sendPacket(self.io, codec.buildEmptyPacket(first.seq + 1));
+                let fin = await proto.readPacket(self.reader);
+                if (codec.isErr(fin.payload)) { rs.err = codec.decodeErr(fin.payload); }
+                else { rs.err = DbError("", "LOAD DATA LOCAL INFILE is not supported by this driver"); }
+                self.busy = false;
+                return rs;
+            }
             if (codec.isOk(first.payload)) {
                 // A resultset-less statement (INSERT/UPDATE/DDL inside a multi-statement run).
                 let ok = ResultSet();
@@ -206,6 +217,20 @@ pub struct MyConnection impl Connection {
             let s = self.stmts.get(d) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
             if (string.eql(s.sql, sql)) { return d; }
             d = d + 1;
+        }
+        // Bound the server-side prepared-statement cache. A long-lived pooled connection that runs
+        // many DISTINCT ad-hoc SQL strings would otherwise accumulate one server-side statement each,
+        // forever (COM_STMT_CLOSE was never sent) — a slow server-memory leak. When the cache is full,
+        // free every cached statement with COM_STMT_CLOSE (no reply) and start fresh. Handles returned
+        // by prepare() are valid until the next flush; query()/queryPrepared use them immediately.
+        if (self.stmts.size() >= 256) {
+            let k = 0;
+            while (k < self.stmts.size()) {
+                let old = self.stmts.get(k) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+                if (old.id > 0) { await proto.sendPacket(self.io, codec.buildStmtClose(old.id)); }
+                k = k + 1;
+            }
+            self.stmts = List<MyStmt>();
         }
         await proto.sendPacket(self.io, codec.buildStmtPrepare(sql));
         let ok = await proto.readPacket(self.reader);

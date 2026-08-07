@@ -279,8 +279,12 @@ fn lenencStrFull(s: string): string { return lenencInt(s.length) + s; }
 
 // COM_STMT_PREPARE (0x16) + SQL.
 pub fn buildStmtPrepare(sql: string): string { return packet(0, u8b(22) + sql); }
-// COM_STMT_CLOSE (0x19) + statement id.
-fn buildStmtClose(stmtId: int): string { return packet(0, u8b(25) + u32le(stmtId)); }
+// COM_STMT_CLOSE (0x19) + statement id. Frees the server-side prepared statement; the server sends
+// no reply, so callers must not read one.
+pub fn buildStmtClose(stmtId: int): string { return packet(0, u8b(25) + u32le(stmtId)); }
+// An empty client packet at sequence `seq`. Sent as the LOCAL INFILE response terminator to tell the
+// server "no file data" and resynchronise the protocol when we refuse an unsolicited LOAD DATA request.
+pub fn buildEmptyPacket(seq: int): string { return packet(seq, ""); }
 // COM_STMT_FETCH (0x1c): stmt_id + num_rows -- fetch the next `numRows` from an OPEN server-side cursor
 // (opened by COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY). This is the X4 streaming primitive.
 pub fn buildStmtFetch(stmtId: int, numRows: int): string { return packet(0, u8b(28) + u32le(stmtId) + u32le(numRows)); }
@@ -558,6 +562,11 @@ pub fn eofStatusFlags(payload: string): int {
 pub fn isEof(p: string): bool { return p.length > 0 && p.length < 9 && p[0] == 254; }
 pub fn isErr(p: string): bool { return p.length > 0 && p[0] == 255; }
 pub fn isOk(p: string): bool { return p.length > 0 && p[0] == 0; }
+// 0xfb as the FIRST byte of a query response is a LOCAL INFILE request (the server wants the client to
+// stream a local file for LOAD DATA LOCAL INFILE). We never send one, so an 0xfb here is either a
+// misconfigured server or an injection attempt; the caller must refuse it and resynchronise rather
+// than mis-read the byte as a column count.
+pub fn isLocalInfile(p: string): bool { return p.length > 0 && p[0] == 251; }
 
 // T8: the KILL QUERY statement for a connection id, using the driver's `${}` int->string rendering.
 pub fn buildKillQuery(connId: int): string { return `KILL QUERY ${connId}`; }
